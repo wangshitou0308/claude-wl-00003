@@ -464,12 +464,17 @@
     badge.hidden = n === 0;
     badge.textContent = n;
     var st = a.stats;
+    function riskTxt(det, risk, unit) {
+      var s = E.fmtSigned(det, 0) + (unit || "");
+      if (risk > 0.05) s += '<span class="risk-add"> 存疑+' + E.fmtSigned(risk, 0) + "</span>";
+      return s;
+    }
     $("#issueSummary").innerHTML =
       '<div class="stat-chip err"><div class="n">' + st.errorCount + '</div><div class="t">错误</div></div>' +
       '<div class="stat-chip warn"><div class="n">' + st.warningCount + '</div><div class="t">警告</div></div>' +
       '<div class="stat-chip doubt"><div class="n">' + st.doubtfulCount + '</div><div class="t">存疑</div></div>' +
-      '<div class="stat-chip gap"><div class="n">' + E.fmtSigned(st.totalGap, 0) + '</div><div class="t">空档合计</div></div>' +
-      '<div class="stat-chip gap"><div class="n">' + E.fmtSigned(st.totalOverlap, 0) + '</div><div class="t">重叠合计</div></div>' +
+      '<div class="stat-chip gap"><div class="n">' + riskTxt(st.totalGap, st.gapRisk, "s") + '</div><div class="t">空档（含存疑）</div></div>' +
+      '<div class="stat-chip gap"><div class="n">' + riskTxt(st.totalOverlap, st.overlapRisk, "s") + '</div><div class="t">重叠（含存疑）</div></div>' +
       '<div class="stat-chip gap"><div class="n">' + E.fmtSigned(st.turnaroundShort, 0) + '</div><div class="t">周转缺口</div></div>';
     if (!n) {
       list.innerHTML = '<li class="issue-empty">未发现排映冲突。<br>存疑提示仍建议在装片时现场复核。</li>';
@@ -491,6 +496,7 @@
     if (!li) return;
     var issue = state.analysis.issues.filter(function (i) { return i.id === li.getAttribute("data-issue"); })[0];
     if (!issue) return;
+    switchTab("reel");
     selectReel(issue.reelId, issue.cue);
     if (issue.t != null) {
       pauseSim();
@@ -587,7 +593,18 @@
       var nx = a.computed[idx + 1];
       if (!nx) return;
       var g = nx.pictureStart - c.changeCueT; // 正=空档，负=重叠
-      if (g > s.gapToleranceSec) {
+      var gLo = nx.cueLeadMin - c.cueLeadMax;
+      var gHi = nx.cueLeadMax - c.cueLeadMin;
+      var tol = s.gapToleranceSec;
+      // 存疑衔接风险包络
+      if (gHi > tol || gLo < -tol) {
+        var xa = xOf(c.changeCueT + Math.min(0, gLo));
+        var xb = xOf(c.changeCueT + Math.max(0, gHi));
+        html.push(rect(xa, GEO.screenY - 3, Math.max(2, xb - xa), GEO.screenH + 6, {
+          fill: "url(#hatchU)", opacity: 0.55,
+        }));
+      }
+      if (g > tol) {
         var xg1 = xOf(c.changeCueT), xg2 = xOf(nx.pictureStart);
         html.push(rect(xg1, GEO.screenY, Math.max(2, xg2 - xg1), GEO.screenH, {
           fill: "url(#hatchGap)", stroke: "#6b7280", "stroke-width": 0.6,
@@ -595,7 +612,7 @@
         if (xg2 - xg1 > 34)
           html.push(text((xg1 + xg2) / 2, GEO.screenY + 14, "空档 " + E.fmtSigned(g, 1) + "s",
             { fill: "#c7cdd6", "font-size": 9.5, "text-anchor": "middle" }));
-      } else if (g < -s.gapToleranceSec) {
+      } else if (g < -tol) {
         var xo1 = xOf(nx.pictureStart), xo2 = xOf(c.changeCueT);
         html.push(rect(xo1, GEO.screenY, Math.max(2, xo2 - xo1), GEO.screenH, {
           fill: "rgba(224,93,93,.55)", stroke: "#a14646", "stroke-width": 0.6,
@@ -1057,8 +1074,16 @@
   /* ============================================================
    * 顶栏按钮：方案库 / 新建 / 导入导出 / 打印
    * ============================================================ */
-  function bindStaticUI() {
-    $("#btnNew").addEventListener("click", createPlan);
+  function switchTab(name) {
+    $$(".tab").forEach(function (t) {
+      t.classList.toggle("tab-active", t.getAttribute("data-tab") === name);
+    });
+    $$(".tab-body").forEach(function (body) {
+      body.hidden = body.getAttribute("data-body") !== name;
+    });
+  }
+
+  function bindStaticUI() {    $("#btnNew").addEventListener("click", createPlan);
     $("#btnOpen").addEventListener("click", openPlanModal);
     $("#btnCompare").addEventListener("click", openCompare);
     $("#btnExport").addEventListener("click", exportCurrent);
@@ -1066,13 +1091,7 @@
     $("#fileInput").addEventListener("change", importFile);
     $("#btnPrint").addEventListener("click", printSheet);
     $$(".tab").forEach(function (tab) {
-      tab.addEventListener("click", function () {
-        $$(".tab").forEach(function (t) { t.classList.toggle("tab-active", t === tab); });
-        var name = tab.getAttribute("data-tab");
-        $$(".tab-body").forEach(function (body) {
-          body.hidden = body.getAttribute("data-body") !== name;
-        });
-      });
+      tab.addEventListener("click", function () { switchTab(tab.getAttribute("data-tab")); });
     });
     $("#btnAddReel").addEventListener("click", addReel);
     $("#btnAlternate").addEventListener("click", alternateReels);
@@ -1215,6 +1234,7 @@
       }
       var errBest = best("errorCount", true), warnBest = best("warningCount", true),
           gapBest = best("totalGap", true), overBest = best("totalOverlap", true),
+          gapRiskBest = best("gapRisk", true), overRiskBest = best("overlapRisk", true),
           turnBest = best("turnaroundShort", true);
       var rows = [
         ["卷数", function (r) { return r.stats.reelCount; }, null],
@@ -1224,6 +1244,8 @@
         ["存疑提示", function (r) { return r.stats.doubtfulCount; }, null],
         ["空档合计", function (r) { return E.fmtSigned(r.stats.totalGap, 0) + " s"; }, gapBest],
         ["重叠合计", function (r) { return E.fmtSigned(r.stats.totalOverlap, 0) + " s"; }, overBest],
+        ["潜在空档（存疑）", function (r) { return E.fmtSigned(r.stats.gapRisk, 0) + " s"; }, gapRiskBest],
+        ["潜在重叠（存疑）", function (r) { return E.fmtSigned(r.stats.overlapRisk, 0) + " s"; }, overRiskBest],
         ["周转缺口", function (r) { return E.fmtSigned(r.stats.turnaroundShort, 0) + " s"; }, turnBest],
         ["机别排列", function (r) {
           return r.reels.map(function (x) { return x.projector === "A" ? "甲" : "乙"; }).join("");
@@ -1241,7 +1263,9 @@
               if (row[0] === "警告" && v > 0 && !cls) cls = "warn";
             }
             if (row[0].indexOf("缺口") >= 0 && v !== "0 s") cls = "bad";
-            if ((row[0] === "空档合计" || row[0] === "重叠合计") && v !== "0 s" && !cls) cls = "warn";
+            if (row[0].indexOf("空档") >= 0 || row[0].indexOf("重叠") >= 0) {
+              if (v !== "0 s" && !cls) cls = row[0].indexOf("存疑") >= 0 ? "warn" : "warn";
+            }
             return '<td class="' + cls + '">' + esc(v) + "</td>";
           }).join("") + "</tr>";
         }).join("") + "</tbody></table>";
@@ -1306,8 +1330,17 @@
       var gapTxt = "—";
       if (nx) {
         var g = nx.pictureStart - c.changeCueT;
-        if (Math.abs(g) <= s.gapToleranceSec) gapTxt = "标准衔接";
-        else gapTxt = (g > 0 ? "空档 " : "重叠 ") + E.fmtSigned(Math.abs(g), 1) + " s";
+        var gLo = nx.cueLeadMin - c.cueLeadMax;
+        var gHi = nx.cueLeadMax - c.cueLeadMin;
+        var parts = [];
+        if (g > s.gapToleranceSec) parts.push("空档 " + E.fmtSigned(g, 1) + " s");
+        else if (g < -s.gapToleranceSec) parts.push("重叠 " + E.fmtSigned(-g, 1) + " s");
+        else parts.push("标准衔接");
+        if (gHi > s.gapToleranceSec && gHi > g)
+          parts.push("存疑空档≤" + E.fmtSigned(gHi, 1) + " s");
+        if (gLo < -s.gapToleranceSec && gLo < g)
+          parts.push("存疑重叠≤" + E.fmtSigned(-gLo, 1) + " s");
+        gapTxt = parts.join("；");
       }
       return "<tr>" +
         "<td>" + (c.idx + 1) + "</td>" +

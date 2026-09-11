@@ -422,37 +422,62 @@
       // （= 本卷 motorCueT + 下一卷自身提示间隔）。
       //   gap>0 切换时下一卷画面未到（黑场）
       //   gap<0 切换时两卷画面同时在银幕（重叠）
-      // 化简：gap = 下一卷「马达→切换」间隔 − 本卷「马达→切换」间隔。
+      // 用两边提示范围给出实际包络 [gapLo, gapHi]：
+      //   gapLo>tol            确定性空档
+      //   gapHi<-tol           确定性重叠
+      //   区间跨 tol / -tol    存疑潜在空档/重叠（可能同时存在两侧风险）
       var gapMid = next.pictureStart - c.changeCueT;
       var gapLo = next.cueLeadMin - c.cueLeadMax;
       var gapHi = next.cueLeadMax - c.cueLeadMin;
+      var tol = settings.gapToleranceSec;
       var doubtfulGap = c.change.uncertain || next.change.uncertain ||
                         c.motor.uncertain || next.motor.uncertain;
-      if (gapLo > settings.gapToleranceSec) {
+
+      function gapIssue(kind, msg, amount, doubt) {
         issues.push(makeIssue({
-          kind: "gap", reelId: reel.id, otherReelId: next.reel.id, t: c.changeCueT,
-          message: "《" + reel.title + "》→《" + next.reel.title +
-            "》切换时银幕空档约 " + fmtSigned(gapMid, 1) + " 秒（切换点早于下一卷画面）。",
-          amount: Math.max(0, gapMid - settings.gapToleranceSec),
-          doubtful: doubtfulGap,
-        }));
-      } else if (gapHi < -settings.gapToleranceSec) {
-        issues.push(makeIssue({
-          kind: "overlap", reelId: reel.id, otherReelId: next.reel.id, t: c.changeCueT,
-          message: "《" + reel.title + "》与《" + next.reel.title +
-            "》画面在银幕重叠约 " + fmtSigned(-gapMid, 1) + " 秒，超过接片容差。",
-          amount: Math.max(0, -gapMid - settings.gapToleranceSec),
-          doubtful: doubtfulGap,
-        }));
-      } else if (gapLo > settings.gapToleranceSec || gapHi < -settings.gapToleranceSec) {
-        issues.push(makeIssue({
-          kind: gapLo > settings.gapToleranceSec ? "gap" : "overlap",
+          kind: kind,
           reelId: reel.id, otherReelId: next.reel.id, t: c.changeCueT,
-          message: "《" + reel.title + "》→《" + next.reel.title +
-            "》衔接" + (gapLo > settings.gapToleranceSec ? "空档" : "重叠") +
-            "落在存疑范围内，需核对提示位置。",
-          amount: 0, doubtful: true,
+          message: msg, amount: amount, doubtful: doubt,
         }));
+      }
+      if (gapLo > tol) {
+        gapIssue("gap",
+          "《" + reel.title + "》→《" + next.reel.title +
+          "》切换时银幕空档约 " + fmtSigned(gapMid, 1) + " 秒。",
+          gapMid - tol, false);
+      } else if (gapHi < -tol) {
+        gapIssue("overlap",
+          "《" + reel.title + "》与《" + next.reel.title +
+          "》画面在银幕重叠约 " + fmtSigned(-gapMid, 1) + " 秒，超过接片容差。",
+          -gapMid - tol, false);
+      } else {
+        // 包络未整体越界：检查存疑范围是否触及任一侧（越过容差才算风险）
+        var gapPossible = gapHi > tol;
+        var overlapPossible = gapLo < -tol;
+        if (gapPossible && overlapPossible) {
+          // 两卷存疑范围交叉：同一衔接的包络同时覆盖空档与重叠
+          gapIssue("gap",
+            "《" + reel.title + "》→《" + next.reel.title +
+            "》存疑提示范围交叉：衔接包络 " + fmtSigned(gapLo, 1) + "～" +
+            fmtSigned(gapHi, 1) + " 秒，可能出现最长 " + fmtSigned(gapHi, 1) +
+            " 秒空档。",
+            gapHi - tol, true);
+          gapIssue("overlap",
+            "《" + reel.title + "》→《" + next.reel.title +
+            "》存疑提示范围交叉：同一衔接可能出现最长 " +
+            fmtSigned(-gapLo, 1) + " 秒画面重叠，请现场核对两卷提示帧。",
+            -gapLo - tol, true);
+        } else if (gapPossible) {
+          gapIssue("gap",
+            "提示存疑时，《" + reel.title + "》→《" + next.reel.title +
+            "》衔接可能出现最长 " + fmtSigned(gapHi, 1) + " 秒银幕空档。",
+            gapHi - tol, true);
+        } else if (overlapPossible) {
+          gapIssue("overlap",
+            "提示存疑时，《" + reel.title + "》与《" + next.reel.title +
+            "》画面可能最长重叠 " + fmtSigned(-gapLo, 1) + " 秒。",
+            -gapLo - tol, true);
+        }
       }
 
       // 片头储备：下一卷片头护片须覆盖「物理片头 → 切换标记」之间的走片
@@ -592,13 +617,19 @@
       if (i.severity === "error") errorN++; else warnN++;
       if (i.doubtful) doubtN++;
     });
-    var gap = 0, overlap = 0, turnaroundShort = 0;
+    var gap = 0, overlap = 0, gapRisk = 0, overlapRisk = 0, turnaroundShort = 0;
     computed.forEach(function (c, idx) {
       var next = computed[idx + 1];
       if (!next) return;
-      var g = next.pictureStart - c.changeCueT;
-      if (g > settings.gapToleranceSec) gap += g;
-      if (g < -settings.gapToleranceSec) overlap += -g;
+      var tol = settings.gapToleranceSec;
+      var gMid = next.pictureStart - c.changeCueT;
+      var gLo = next.cueLeadMin - c.cueLeadMax;
+      var gHi = next.cueLeadMax - c.cueLeadMin;
+      if (gMid > tol) gap += gMid - tol;
+      if (gMid < -tol) overlap += -gMid - tol;
+      // 存疑包络中的潜在量（超出中点确定性部分、越过容差的量）
+      if (gHi > tol) gapRisk += Math.max(0, gHi - Math.max(tol, gMid));
+      if (gLo < -tol) overlapRisk += Math.max(0, Math.min(-tol, gMid) - gLo);
       if (c.turnaround && c.turnaround.slack < 0)
         turnaroundShort += -c.turnaround.slack;
     });
@@ -612,6 +643,8 @@
       doubtfulCount: doubtN,
       totalGap: gap,
       totalOverlap: overlap,
+      gapRisk: gapRisk,
+      overlapRisk: overlapRisk,
       turnaroundShort: turnaroundShort,
       showStart: showStart,
       showEnd: showEnd,
