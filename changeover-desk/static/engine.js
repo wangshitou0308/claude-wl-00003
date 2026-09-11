@@ -333,12 +333,12 @@
     });
 
     // 2) 时刻链
-    // 物理卷从物理片头开始走片；动作片头(画面开始)在 headLeader 之后。
-    // 首卷：画面开始取 0（开映），开映前手动启动马达。
-    // 双机衔接：上一卷切换提示触发切换；为保证切换时下一卷已稳速、
-    // 且其切换标记正好到达片窗，下一卷动作片头须在切换前提前进入——
-    // 即 pictureStart(i+1) = changeT(i) - 本卷切换标记距画面末尾的秒数
-    // （标准 SMPTE 24 格标记 => 两卷画面在银幕重叠约 1 秒）。
+    // 约定（换片挂片法）：下一卷按自己的马达提示位置预挂，
+    // 上一卷马达提示到达片窗时启动下一台机器；下一卷从启动到自己
+    // 动作片头（第一格画面）所用时间 = 本卷「马达提示→切换提示」间隔。
+    // 因此标准双机（两卷提示间隔相同）切换点恰为下一卷动作片头到达点，
+    // 空档/重叠为 0；提示帧不准时，差值即为银幕空档（正）或重叠（负）。
+    //   画面时刻沿「马达提示链」传播；切换时刻由各卷切换提示独立决定。
     var picStart = 0;
     computed.forEach(function (c, idx) {
       c.pictureStart = picStart;
@@ -351,27 +351,23 @@
       c.changeCueMax = picStart + c.cOff.max / c.fps;
       c.picEnd = picStart + c.picSec;
       if (idx === 0) {
-        // 开映前手动启动：动作片头到达片窗时已稳速，并提前 motorLeadSec
         c.motorStart = Math.min(
           picStart - settings.accelSec,
           picStart - settings.motorLeadSec
         );
       } else {
-        // 上一卷的马达提示 = 本机启动信号；本机动作片头随后走片
         c.motorStart = computed[idx - 1].motorCueT - settings.accelSec;
       }
       c.stopTime = c.changeCueT + settings.tailRunoffSec;
-      // 回卷所需时长（回卷画面+护片总长）
       c.rewindSec = c.totalSec / settings.rewindFactor;
       var rewindBase = settings.rewindMode === "parallel" ? c.changeCueT : c.stopTime;
       c.rewindEnd = rewindBase + c.rewindSec;
       c.threadedFor = c.rewindEnd + settings.laceSec;
       if (idx < computed.length - 1) {
         var nc2 = computed[idx + 1];
-        // 衔接原则：下一卷动作片头到达片窗时，本卷正好放完画面末尾，
-        // 银幕内容不中断；随后本卷仍走片尾，下一卷走自己的片头/画面，
-        // 到本卷切换提示处切机（标准 SMPTE 下两机画面重叠约 1 秒）。
-        picStart = c.picEnd;
+        // 下一卷动作片头 = 上一卷马达提示 + 下一卷自身提示间隔（挂片约定）
+        picStart = c.motorCueT +
+          (nc2.cOff.mid - nc2.mOff.mid) / nc2.fps;
       }
     });
 
@@ -387,13 +383,16 @@
         var nc = computed[idx + 1];
         events.push(evt(c, "motor", c.motorCueT,
           "马达提示：启动" + (nc.reel.projector === "A" ? "甲机" : "乙机") +
-          "《" + nc.reel.title + "》"));
+          "《" + nc.reel.title + "》", nc.reel));
+        events.push(evt(c, "change", c.changeCueT,
+          "切换提示：切到" + (nc.reel.projector === "A" ? "甲机" : "乙机") +
+          "《" + nc.reel.title + "》", nc.reel));
       } else {
         events.push(evt(c, "motor", c.motorCueT,
           "末卷马达提示标记（无下一卷）"));
+        events.push(evt(c, "change", c.changeCueT,
+          "末卷切换提示：终场切灯"));
       }
-      events.push(evt(c, "change", c.changeCueT,
-        "切换至《" + reel.title + "》（切换提示）"));
       events.push(evt(c, "stop", c.stopTime,
         projName + " 停机《" + reel.title + "》"));
       if (idx < computed.length - 1) {
@@ -418,23 +417,17 @@
       var next = computed[idx + 1];
       if (!next) return;
 
-      // 空档 / 重叠（两台机器画面段在银幕上的实际覆盖）：
-      // 本卷画面 [pictureStart, picEnd]；下卷画面 [next.pictureStart, next.picEnd]。
-      // 调度保证下卷「切换标记」落在本卷 changeCueT；但两段画面的相对位置
-      // 由各自护片长度与提示位置决定：
-      //   gap>0 本卷画面放完后、下卷画面才到（黑场）
-      //   gap<0 两段画面在银幕同时可见（重叠）；标准 SMPTE 约 −1 秒
-      var gapMid = next.pictureStart - c.picEnd;
-      var nextChangeFromEndMin = (settings.cueRef === "tail"
-        ? next.change.min
-        : next.headFrames + next.picFrames - next.cOff.max) / next.fps;
-      var nextChangeFromEndMax = (settings.cueRef === "tail"
-        ? next.change.max
-        : next.headFrames + next.picFrames - next.cOff.min) / next.fps;
-      // next.pictureStart = c.changeCueT − 下卷 change-from-end
-      var gapLo = c.changeCueMin - nextChangeFromEndMax - c.picEnd;
-      var gapHi = c.changeCueMax - nextChangeFromEndMin - c.picEnd;
-      var doubtfulGap = c.change.uncertain || next.change.uncertain;
+      // 空档 / 重叠：
+      // 切换在本卷 changeCueT；下一卷动作片头在 next.pictureStart
+      // （= 本卷 motorCueT + 下一卷自身提示间隔）。
+      //   gap>0 切换时下一卷画面未到（黑场）
+      //   gap<0 切换时两卷画面同时在银幕（重叠）
+      // 化简：gap = 下一卷「马达→切换」间隔 − 本卷「马达→切换」间隔。
+      var gapMid = next.pictureStart - c.changeCueT;
+      var gapLo = next.cueLeadMin - c.cueLeadMax;
+      var gapHi = next.cueLeadMax - c.cueLeadMin;
+      var doubtfulGap = c.change.uncertain || next.change.uncertain ||
+                        c.motor.uncertain || next.motor.uncertain;
       if (gapLo > settings.gapToleranceSec) {
         issues.push(makeIssue({
           kind: "gap", reelId: reel.id, otherReelId: next.reel.id, t: c.changeCueT,
@@ -580,12 +573,13 @@
     return null;
   }
 
-  function evt(c, kind, t, label) {
+  function evt(c, kind, t, label, targetReel) {
+    var r = targetReel || c.reel;
     return {
       id: c.reel.id + "_" + kind,
-      reelId: c.reel.id,
+      reelId: r.id,
       idx: c.idx,
-      projector: c.reel.projector,
+      projector: r.projector,
       kind: kind,
       t: t,
       label: label,
@@ -602,7 +596,7 @@
     computed.forEach(function (c, idx) {
       var next = computed[idx + 1];
       if (!next) return;
-      var g = next.pictureStart - c.picEnd;
+      var g = next.pictureStart - c.changeCueT;
       if (g > settings.gapToleranceSec) gap += g;
       if (g < -settings.gapToleranceSec) overlap += -g;
       if (c.turnaround && c.turnaround.slack < 0)

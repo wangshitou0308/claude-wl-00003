@@ -173,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         if path == "/" or path == "/index.html":
-            self.serve_static("index.html")
+            self.serve_static("/")
             return
         if path.startswith("/static/"):
             self.serve_static(path)

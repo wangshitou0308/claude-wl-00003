@@ -581,16 +581,14 @@
       html.push(rect(sx1, GEO.screenY, Math.max(1, sx2 - sx1), GEO.screenH, {
         fill: "rgba(79,195,176,.22)", stroke: "#2e6b60", "stroke-width": 0.8,
       }));
-      html.push(line(sx2, GEO.screenY - 2, sx2, GEO.screenY + GEO.screenH + 2,
-        { stroke: "#4fc3b0", "stroke-width": 0.8, "stroke-dasharray": "2 2" }));
     });
-    // 空档 / 重叠（本卷画面末尾 c.picEnd 相对 下卷动作片头 nx.pictureStart）
+    // 空档 / 重叠：切换点 c.changeCueT 与 下卷动作片头 nx.pictureStart 之间
     a.computed.forEach(function (c, idx) {
       var nx = a.computed[idx + 1];
       if (!nx) return;
-      var g = nx.pictureStart - c.picEnd; // 正=空档，负=重叠
+      var g = nx.pictureStart - c.changeCueT; // 正=空档，负=重叠
       if (g > s.gapToleranceSec) {
-        var xg1 = xOf(c.picEnd), xg2 = xOf(nx.pictureStart);
+        var xg1 = xOf(c.changeCueT), xg2 = xOf(nx.pictureStart);
         html.push(rect(xg1, GEO.screenY, Math.max(2, xg2 - xg1), GEO.screenH, {
           fill: "url(#hatchGap)", stroke: "#6b7280", "stroke-width": 0.6,
         }));
@@ -598,7 +596,7 @@
           html.push(text((xg1 + xg2) / 2, GEO.screenY + 14, "空档 " + E.fmtSigned(g, 1) + "s",
             { fill: "#c7cdd6", "font-size": 9.5, "text-anchor": "middle" }));
       } else if (g < -s.gapToleranceSec) {
-        var xo1 = xOf(nx.pictureStart), xo2 = xOf(c.picEnd);
+        var xo1 = xOf(nx.pictureStart), xo2 = xOf(c.changeCueT);
         html.push(rect(xo1, GEO.screenY, Math.max(2, xo2 - xo1), GEO.screenH, {
           fill: "rgba(224,93,93,.55)", stroke: "#a14646", "stroke-width": 0.6,
         }));
@@ -606,6 +604,10 @@
           html.push(text((xo1 + xo2) / 2, GEO.screenY + 14, "重叠 " + E.fmtSigned(-g, 1) + "s",
             { fill: "#ffd9d9", "font-size": 9.5, "text-anchor": "middle" }));
       }
+      // 切换刻点
+      var xs = xOf(c.changeCueT);
+      html.push(line(xs, GEO.screenY - 3, xs, GEO.screenY + GEO.screenH + 3,
+        { stroke: "#e05d5d", "stroke-width": 1.1 }));
     });
     // ---- 胶卷块
     a.computed.forEach(function (c) { html.push(reelBlock(c, a)); });
@@ -997,12 +999,16 @@
     renderPlayhead(); renderSimCards(); renderEventLog();
   }
 
+  // 切换发生在每卷（除末卷）的 changeCueT；切换后银幕为下一卷。
   function screenReelAt(t) {
-    var cur = null;
-    state.analysis.computed.forEach(function (c) {
-      if (c.pictureStart <= t + 1e-6) cur = c;
-    });
-    return cur;
+    var a = state.analysis;
+    if (!a || !a.computed.length) return null;
+    var current = a.computed[0];
+    for (var i = 0; i < a.computed.length - 1; i++) {
+      if (t >= a.computed[i].changeCueT - 1e-6) current = a.computed[i + 1];
+      else break;
+    }
+    return current;
   }
 
   function renderSimCards() {
@@ -1059,6 +1065,15 @@
     $("#btnImport").addEventListener("click", function () { $("#fileInput").click(); });
     $("#fileInput").addEventListener("change", importFile);
     $("#btnPrint").addEventListener("click", printSheet);
+    $$(".tab").forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        $$(".tab").forEach(function (t) { t.classList.toggle("tab-active", t === tab); });
+        var name = tab.getAttribute("data-tab");
+        $$(".tab-body").forEach(function (body) {
+          body.hidden = body.getAttribute("data-body") !== name;
+        });
+      });
+    });
     $("#btnAddReel").addEventListener("click", addReel);
     $("#btnAlternate").addEventListener("click", alternateReels);
     $("#simPlay").addEventListener("click", togglePlay);
@@ -1281,15 +1296,26 @@
   function printSheet() {
     if (!state.plan || !state.analysis) return;
     var a = state.analysis, s = a.settings;
-    var rows = a.computed.map(function (c) {
+    var rows = a.computed.map(function (c, idx) {
       function cell(t) { return E.fmtClock(t) + "<br><span class='tc'>" + E.fmtTimecode(t, c.fps) + "</span>"; }
       var doubt = c.motor.uncertain || c.change.uncertain;
+      var nx = a.computed[idx + 1];
+      var target = nx
+        ? (nx.reel.projector === "A" ? "甲机" : "乙机") + " " + esc(nx.reel.title)
+        : "终场切灯";
+      var gapTxt = "—";
+      if (nx) {
+        var g = nx.pictureStart - c.changeCueT;
+        if (Math.abs(g) <= s.gapToleranceSec) gapTxt = "标准衔接";
+        else gapTxt = (g > 0 ? "空档 " : "重叠 ") + E.fmtSigned(Math.abs(g), 1) + " s";
+      }
       return "<tr>" +
         "<td>" + (c.idx + 1) + "</td>" +
         '<td class="l">' + esc(c.reel.title) + (c.reel.locked ? " 🔒" : "") + "</td>" +
         "<td>" + (c.reel.projector === "A" ? "甲机" : "乙机") + "</td>" +
         "<td>" + cell(c.motorCueT) + (c.motor.uncertain ? " <b>?</b>" : "") + "</td>" +
         "<td>" + cell(c.changeCueT) + (c.change.uncertain ? " <b>?</b>" : "") + "</td>" +
+        '<td class="l">' + target + "<br><span class='tc'>" + gapTxt + "</span></td>" +
         "<td>" + E.fmtSigned(c.cueLeadMin, 1) + "–" + E.fmtSigned(c.cueLeadMax, 1) + " s</td>" +
         "<td>" + cell(c.motorStart) + "</td>" +
         "<td>" + cell(c.stopTime) + "</td>" +
@@ -1312,7 +1338,7 @@
       '<div class="ps-section-title">逐卷时刻表（上行 分:秒.十分秒 ／ 下行 时:分:秒:格）</div>' +
       "<table><thead><tr>" +
         "<th>序</th><th>卷次</th><th>机别</th><th>马达提示</th><th>切换提示</th>" +
-        "<th>间隔</th><th>马达启动</th><th>停机</th><th>回卷就绪</th><th>备注</th>" +
+        "<th>信号目标 / 衔接</th><th>间隔</th><th>马达启动</th><th>停机</th><th>回卷就绪</th><th>备注</th>" +
       "</tr></thead><tbody>" + rows + "</tbody></table>" +
       (warns.length ? '<div class="ps-section-title">现场留意（' + warns.length + '）</div>' +
         warns.map(function (i) { return "· " + esc(i.message) + (i.doubtful ? "（存疑）" : "") + "<br>"; }).join("") : "") +
