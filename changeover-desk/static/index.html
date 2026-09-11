@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>胶片双机换卷推演台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22">
+        <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+        <g fill="currentColor">
+          <circle cx="12" cy="4.4" r="1.3"/><circle cx="12" cy="19.6" r="1.3"/>
+          <circle cx="4.4" cy="12" r="1.3"/><circle cx="19.6" cy="12" r="1.3"/>
+        </g>
+      </svg>
+    </span>
+    <div>
+      <div class="brand-title">胶片双机换卷推演台</div>
+      <div class="brand-sub">资料馆 / 小型影院 · 本地离线排练</div>
+    </div>
+  </div>
+
+  <div class="plan-box">
+    <label class="plan-name-label">当前方案
+      <input id="planName" type="text" maxlength="120" spellcheck="false">
+    </label>
+    <span id="saveState" class="save-state" title="自动保存状态"></span>
+  </div>
+
+  <div class="top-actions">
+    <button id="btnNew" class="btn">新建方案</button>
+    <button id="btnOpen" class="btn">方案库</button>
+    <button id="btnCompare" class="btn">比较方案</button>
+    <button id="btnImport" class="btn">导入 JSON</button>
+    <button id="btnExport" class="btn btn-primary">导出 JSON</button>
+    <button id="btnPrint" class="btn btn-accent">打印换机提示单</button>
+    <input id="fileInput" type="file" accept="application/json,.json" hidden>
+  </div>
+</header>
+
+<main class="shell">
+
+  <!-- ================= 左栏：卷列表 ================= -->
+  <aside class="panel panel-left">
+    <div class="panel-head">
+      <h2>卷序</h2>
+      <div class="panel-head-actions">
+        <button id="btnAddReel" class="btn btn-sm" title="在末尾追加一卷">＋ 新卷</button>
+        <button id="btnAlternate" class="btn btn-sm" title="按卷序自动分配甲/乙机">自动交替</button>
+      </div>
+    </div>
+    <div class="panel-tip">拖动时间轴上的胶片块可调序或换机；勾选锁表示已核对。</div>
+    <ol id="reelList" class="reel-list"></ol>
+  </aside>
+
+  <!-- ================= 中栏：时间轴 + 模拟 ================= -->
+  <section class="panel panel-center">
+    <div class="timeline-toolbar">
+      <div class="zoom-controls">
+        <button id="zoomOut" class="btn btn-sm" title="缩小">－</button>
+        <span id="zoomLabel" class="zoom-label">100%</span>
+        <button id="zoomIn" class="btn btn-sm" title="放大">＋</button>
+        <button id="zoomFit" class="btn btn-sm" title="适应全部">适应</button>
+      </div>
+      <div class="legend">
+        <span class="lg"><i class="lg-motor"></i>马达提示</span>
+        <span class="lg"><i class="lg-change"></i>切换提示</span>
+        <span class="lg"><i class="lg-ready"></i>就绪/停机</span>
+        <span class="lg"><i class="lg-gap"></i>空档</span>
+        <span class="lg"><i class="lg-overlap"></i>重叠</span>
+        <span class="lg"><i class="lg-uncertain"></i>存疑范围</span>
+      </div>
+    </div>
+
+    <div id="timelineScroll" class="timeline-scroll">
+      <div class="timeline-lane-label lane-label-ruler">时刻</div>
+      <svg id="timeline" class="timeline-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="playheadTag" class="playhead-tag" hidden>00:00.0</div>
+    </div>
+
+    <div class="sim-bar">
+      <button id="simPrev" class="btn btn-sm" title="上一提示">◀ 提示</button>
+      <button id="simPlay" class="btn btn-primary btn-sm">▶ 逐步模拟</button>
+      <button id="simNext" class="btn btn-sm" title="下一提示">提示 ▶</button>
+      <button id="simReset" class="btn btn-sm">⏮ 复位</button>
+      <label class="speed-label">速度
+        <select id="simSpeed">
+          <option value="1">实时 ×1</option>
+          <option value="4">×4</option>
+          <option value="15" selected>×15</option>
+          <option value="60">×60</option>
+          <option value="300">×300</option>
+        </select>
+      </label>
+      <div class="sim-cards">
+        <div class="sim-card">
+          <div class="sim-card-label">模拟时刻</div>
+          <div id="simClock" class="sim-card-value">--:--</div>
+        </div>
+        <div class="sim-card sim-card-current">
+          <div class="sim-card-label">银幕当前卷</div>
+          <div id="simCurrent" class="sim-card-value">—</div>
+        </div>
+        <div class="sim-card sim-card-next">
+          <div class="sim-card-label">下一提示</div>
+          <div id="simNextCue" class="sim-card-value">—</div>
+          <div id="simCountdown" class="sim-card-sub"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="event-log-wrap">
+      <div class="event-log-head">提示时刻表（点击跳转）</div>
+      <ol id="eventLog" class="event-log"></ol>
+    </div>
+  </section>
+
+  <!-- ================= 右栏：属性 + 问题 ================= -->
+  <aside class="panel panel-right">
+    <div class="tabs">
+      <button class="tab tab-active" data-tab="reel">本卷参数</button>
+      <button class="tab" data-tab="settings">方案设置</button>
+      <button class="tab tab-issues" data-tab="issues">
+        冲突检查 <span id="issueBadge" class="badge" hidden>0</span>
+      </button>
+    </div>
+
+    <div class="tab-body" data-body="reel">
+      <div id="reelEditor" class="reel-editor"></div>
+    </div>
+
+    <div class="tab-body" data-body="settings" hidden>
+      <div id="settingsEditor" class="settings-editor"></div>
+    </div>
+
+    <div class="tab-body" data-body="issues" hidden>
+      <div id="issueSummary" class="issue-summary"></div>
+      <ul id="issueList" class="issue-list"></ul>
+    </div>
+  </aside>
+</main>
+
+<!-- ================= 方案库弹窗 ================= -->
+<div id="planModal" class="modal" hidden>
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <h2 id="planModalTitle">方案库</h2>
+      <button class="modal-close" data-close="planModal">×</button>
+    </div>
+    <div id="planModalBody" class="modal-body"></div>
+  </div>
+</div>
+
+<!-- ================= 比较弹窗 ================= -->
+<div id="compareModal" class="modal" hidden>
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <h2>方案比较</h2>
+      <button class="modal-close" data-close="compareModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">勾选两个或更多方案，对照冲突数、空档/重叠与周转余量。</p>
+      <div id="comparePick" class="compare-pick"></div>
+      <div id="compareTableWrap" class="compare-wrap"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 打印用换机提示单 ================= -->
+<div id="printSheet" class="print-sheet"></div>
+
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
