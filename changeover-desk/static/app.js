@@ -1111,6 +1111,7 @@
     });
     document.addEventListener("keydown", function (ev) {
       if (document.body.classList.contains("rehearsal-open")) return;
+      if (document.body.classList.contains("inspection-open")) return;
       if (ev.code === "Space" && !/INPUT|TEXTAREA|SELECT|BUTTON/.test(document.activeElement.tagName)) {
         ev.preventDefault(); togglePlay();
       }

@@ -21,6 +21,12 @@
   POST /api/rehearsals         -> 新建排练（ready，冻结方案卷序与目标时刻）
   PUT  /api/rehearsals/<id>    -> 更新排练（状态机校验；completed 拒绝改写）
   DELETE /api/rehearsals/<id>  -> 删除排练（completed 拒绝删除）
+
+  GET  /api/inspections?planId= -> 验片单列表（可按方案过滤）
+  GET  /api/inspections/<id>    -> 单张验片单（含冻结快照与逐卷问题）
+  POST /api/inspections         -> 新建验片单（逐卷从 pending 起，冻结方案快照）
+  PUT  /api/inspections/<id>    -> 更新验片单（逐卷状态机；已放行/已退回卷拒绝改写）
+  DELETE /api/inspections/<id>  -> 删除验片单（任一卷已放行/已退回则拒绝）
 """
 
 import json
@@ -29,6 +35,7 @@ import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import isfinite
 from urllib.parse import parse_qs, unquote, urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +81,21 @@ def init_db():
         )
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_rehearsals_plan ON rehearsals(plan_id)"
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inspections (
+                id          TEXT PRIMARY KEY,
+                plan_id     TEXT NOT NULL,
+                name        TEXT NOT NULL DEFAULT '',
+                data        TEXT NOT NULL DEFAULT '{}',
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            )
+            """
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inspections_plan ON inspections(plan_id)"
         )
 
 
@@ -200,6 +222,198 @@ def rehearsal_summary(row):
     }
 
 
+# ---------------------------------------------------------------- 拷贝验片单
+
+INSPECTION_REEL_STATUSES = ("pending", "checking", "action", "released", "returned")
+
+# 逐卷状态机：已放行 / 已退回为终态；其余可自由流转
+INSPECTION_REEL_TRANSITIONS = {
+    "pending":  ("pending", "checking", "action", "released", "returned"),
+    "checking": ("checking", "action", "pending", "released", "returned"),
+    "action":   ("action", "checking", "pending", "released", "returned"),
+    "released": ("released",),
+    "returned": ("returned",),
+}
+
+FINDING_KINDS = ("splice", "perf", "scratch", "shrink", "headtail", "cue")
+FINDING_SEVERITIES = ("info", "minor", "major", "critical")
+DISPOSITIONS = ("clean", "resplice", "replaceLeader", "remark", "hold", "")
+
+
+def _as_num(v):
+    try:
+        n = float(v)
+        return n if isfinite(n) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def finding_open(f):
+    """未决判定：非 info 问题必须有处置且复查通过；hold（保留待定）始终未决。"""
+    sev = f.get("severity")
+    if sev == "info":
+        return False
+    disp = f.get("disposition") or ""
+    if disp == "hold" or disp not in DISPOSITIONS or disp == "":
+        return True
+    return not f.get("recheckPassed")
+
+
+def canonical_finding(f):
+    """收敛为白名单字段，避免前端写入任意结构。"""
+    kind = f.get("kind") if f.get("kind") in FINDING_KINDS else "scratch"
+    sev = f.get("severity") if f.get("severity") in FINDING_SEVERITIES else "minor"
+    disp = f.get("disposition") or ""
+    if disp not in DISPOSITIONS:
+        disp = ""
+    measure = f.get("measure") if isinstance(f.get("measure"), dict) else {}
+    clean_measure = {}
+    for mk in ("value", "to", "unit"):
+        if mk in measure:
+            if mk == "unit":
+                clean_measure[mk] = str(measure[mk])[:12]
+            else:
+                mv = _as_num(measure[mk])
+                if mv is not None:
+                    clean_measure[mk] = mv
+    rechecks = f.get("rechecks") if isinstance(f.get("rechecks"), list) else []
+    clean_rechecks = []
+    for rc in rechecks[-20:]:
+        if not isinstance(rc, dict):
+            continue
+        clean_rechecks.append({
+            "at": _as_int(rc.get("at")) or 0,
+            "passed": bool(rc.get("passed")),
+            "note": str(rc.get("note") or "")[:500],
+        })
+    return {
+        "id": str(f.get("id") or "")[:80],
+        "kind": kind,
+        "severity": sev,
+        "from": max(0, _as_num(f.get("from")) or 0),
+        "to": max(0, _as_num(f.get("to")) or 0),
+        "measure": clean_measure,
+        "note": str(f.get("note") or "")[:1000],
+        "disposition": disp,
+        "dispositionNote": str(f.get("dispositionNote") or "")[:1000],
+        "dispositionAt": _as_int(f.get("dispositionAt")),
+        "recheckPassed": bool(f.get("recheckPassed")),
+        "rechecks": clean_rechecks,
+        "createdAt": _as_int(f.get("createdAt")) or 0,
+    }
+
+
+def validate_inspection(payload, require_frozen=False):
+    """结构校验。frozen 只在新建时接受，更新时以已存快照为准。"""
+    if not isinstance(payload, dict):
+        return None, "请求体不是 JSON 对象"
+    plan_id = str(payload.get("planId") or "").strip()
+    if not plan_id:
+        return None, "缺少 planId"
+    frozen = payload.get("frozen") if isinstance(payload.get("frozen"), dict) else {}
+    freels = frozen.get("reels") if isinstance(frozen.get("reels"), list) else None
+    if require_frozen:
+        if not freels:
+            return None, "缺少冻结快照 frozen.reels"
+    reels_in = payload.get("reels") if isinstance(payload.get("reels"), list) else []
+    reels = []
+    for r in reels_in:
+        if not isinstance(r, dict):
+            return None, "reels 项必须是对象"
+        status = r.get("status")
+        if status not in INSPECTION_REEL_STATUSES:
+            return None, "非法卷状态：" + str(status)
+        findings = r.get("findings") if isinstance(r.get("findings"), list) else []
+        reels.append({
+            "reelId": str(r.get("reelId") or "")[:80],
+            "status": status,
+            "findings": [canonical_finding(f) for f in findings if isinstance(f, dict)],
+        })
+    data = {
+        "id": str(payload.get("id") or "")[:80],
+        "planId": plan_id,
+        "name": str(payload.get("name") or "验片单")[:120],
+        "inspector": str(payload.get("inspector") or "")[:80],
+        "note": str(payload.get("note") or "")[:2000],
+        "frozen": frozen if require_frozen else {},
+        "reels": reels,
+    }
+    return data, None
+
+
+def row_to_inspection(row, plan_updated_at=None, plan_hash=None):
+    data = json.loads(row["data"] or "{}")
+    data["id"] = row["id"]
+    data["planId"] = row["plan_id"]
+    data["name"] = row["name"]
+    data["createdAt"] = row["created_at"]
+    data["updatedAt"] = row["updated_at"]
+    if plan_updated_at is not None:
+        fz = data.get("frozen") or {}
+        # 内容哈希优先：方案被实际改动才过期，无意义的重复保存不触发；
+        # 旧单据没有哈希时退回更新时间戳比对。
+        if plan_hash is not None and fz.get("planHash") is not None:
+            data["snapshotStale"] = fz.get("planHash") != plan_hash
+        else:
+            data["snapshotStale"] = fz.get("planUpdatedAt") is not None and \
+                fz.get("planUpdatedAt") != plan_updated_at
+    return data
+
+
+def plan_content_hash(plan_row):
+    """对换卷方案中会被验片快照引用的参数做稳定哈希。"""
+    import hashlib
+    settings = json.loads(plan_row["settings"] or "{}")
+    reels = json.loads(plan_row["reels"] or "[]")
+    keys = (
+        "projector", "fps", "gauge", "lengthUnit", "lengthValue",
+        "headLeaderFt", "tailLeaderFt",
+        "motorCue", "motorCueMax", "motorCueU",
+        "changeCue", "changeCueMax", "changeCueU",
+    )
+    sig = {
+        "settings": {k: settings.get(k) for k in (
+            "fps", "gauge", "cueRef", "headLeaderFt", "tailLeaderFt")},
+        # 仅快照实际冻结的参数（卷序、片长、提示帧、护片）；卷名/备注/锁定不影响
+        "reels": [
+            [r.get("id")] + [r.get(k) for k in keys] for r in reels
+        ],
+    }
+    blob = json.dumps(sig, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def inspection_summary(row, plan_updated_at=None, plan_hash=None):
+    data = json.loads(row["data"] or "{}")
+    frozen = data.get("frozen") or {}
+    reels = data.get("reels") or []
+    counts = {s: 0 for s in INSPECTION_REEL_STATUSES}
+    open_findings = 0
+    for r in reels:
+        counts[r.get("status") or "pending"] = counts.get(r.get("status") or "pending", 0) + 1
+        for f in r.get("findings") or []:
+            if finding_open(f):
+                open_findings += 1
+    if plan_hash is not None and frozen.get("planHash") is not None:
+        stale = frozen.get("planHash") != plan_hash
+    else:
+        stale = frozen.get("planUpdatedAt") is not None and plan_updated_at is not None and \
+            frozen.get("planUpdatedAt") != plan_updated_at
+    return {
+        "id": row["id"],
+        "planId": row["plan_id"],
+        "name": row["name"],
+        "inspector": data.get("inspector") or "",
+        "reelCount": len(frozen.get("reels") or []),
+        "counts": counts,
+        "openFindings": open_findings,
+        "snapshotStale": stale,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+
 # ---------------------------------------------------------------- HTTP 处理
 
 STATIC_MIME = {
@@ -297,6 +511,25 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT * FROM rehearsals ORDER BY updated_at DESC").fetchall()
             self.send_json([rehearsal_summary(r) for r in rows])
             return
+        if path == "/api/inspections":
+            qs = parse_qs(parsed.query)
+            plan_id = qs.get("planId", [None])[0]
+            with _db_lock, get_db() as db:
+                if plan_id:
+                    rows = db.execute(
+                        "SELECT * FROM inspections WHERE plan_id = ? ORDER BY created_at ASC",
+                        (plan_id,)).fetchall()
+                    plan_row = db.execute(
+                        "SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+                    plan_at = plan_row["updated_at"] if plan_row else None
+                    plan_h = plan_content_hash(plan_row) if plan_row else None
+                else:
+                    rows = db.execute(
+                        "SELECT * FROM inspections ORDER BY updated_at DESC").fetchall()
+                    plan_at = None
+                    plan_h = None
+            self.send_json([inspection_summary(r, plan_at, plan_h) for r in rows])
+            return
         if path.startswith("/api/rehearsals/"):
             rid = path[len("/api/rehearsals/"):]
             with _db_lock, get_db() as db:
@@ -305,6 +538,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error_json(404, "排练记录不存在")
                 return
             self.send_json(row_to_rehearsal(row))
+            return
+        if path.startswith("/api/inspections/"):
+            iid = path[len("/api/inspections/"):]
+            with _db_lock, get_db() as db:
+                row = db.execute("SELECT * FROM inspections WHERE id = ?", (iid,)).fetchone()
+                plan_at = None
+                plan_h = None
+                if row:
+                    plan_row = db.execute(
+                        "SELECT * FROM plans WHERE id = ?", (row["plan_id"],)).fetchone()
+                    if plan_row:
+                        plan_at = plan_row["updated_at"]
+                        plan_h = plan_content_hash(plan_row)
+            if not row:
+                self.send_error_json(404, "验片单不存在")
+                return
+            self.send_json(row_to_inspection(row, plan_at, plan_h))
             return
         if path.startswith("/api/plans/"):
             pid = path[len("/api/plans/"):]
@@ -408,6 +658,39 @@ class Handler(BaseHTTPRequestHandler):
                 row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
             self.send_json(row_to_rehearsal(row), 201)
             return
+        if path == "/api/inspections":
+            clean, err = validate_inspection(payload, require_frozen=True)
+            if err:
+                self.send_error_json(400, err)
+                return
+            iid = clean["id"] or f"ins_{int(time.time()*1000)}"
+            clean["id"] = iid
+            now = int(time.time() * 1000)
+            with _db_lock, get_db() as db:
+                plan_row = db.execute("SELECT * FROM plans WHERE id = ?",
+                                      (clean["planId"],)).fetchone()
+                if not plan_row:
+                    self.send_error_json(404, "关联方案不存在")
+                    return
+                if db.execute("SELECT 1 FROM inspections WHERE id = ?", (iid,)).fetchone():
+                    self.send_error_json(409, "验片单 ID 已存在")
+                    return
+                # 冻结快照的方案指纹与时间戳以已落盘方案为准（服务端权威）
+                clean["frozen"]["planHash"] = plan_content_hash(plan_row)
+                clean["frozen"]["planUpdatedAt"] = plan_row["updated_at"]
+                # 新建时逐卷状态一律从 pending 起，冻结快照以本次提交为准
+                for r in clean["reels"]:
+                    r["status"] = "pending"
+                db.execute(
+                    "INSERT INTO inspections (id, plan_id, name, data, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (iid, clean["planId"], clean["name"],
+                     json.dumps(clean, ensure_ascii=False), now, now),
+                )
+                row = db.execute("SELECT * FROM inspections WHERE id = ?", (iid,)).fetchone()
+            self.send_json(row_to_inspection(
+                row, plan_row["updated_at"], plan_content_hash(plan_row)), 201)
+            return
         self.send_error_json(404, "未知路径")
 
     def do_PUT(self):
@@ -415,6 +698,9 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         if path.startswith("/api/rehearsals/"):
             self.update_rehearsal(path[len("/api/rehearsals/"):])
+            return
+        if path.startswith("/api/inspections/"):
+            self.update_inspection(path[len("/api/inspections/"):])
             return
         if not path.startswith("/api/plans/"):
             self.send_error_json(404, "未知路径")
@@ -492,9 +778,114 @@ class Handler(BaseHTTPRequestHandler):
             row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
         self.send_json(row_to_rehearsal(row))
 
+    def update_inspection(self, iid):
+        payload = self.read_json()
+        if payload is None:
+            self.send_error_json(400, "JSON 解析失败")
+            return
+        clean, err = validate_inspection(payload, require_frozen=False)
+        if err:
+            self.send_error_json(400, err)
+            return
+        now = int(time.time() * 1000)
+        with _db_lock, get_db() as db:
+            row = db.execute("SELECT * FROM inspections WHERE id = ?", (iid,)).fetchone()
+            if not row:
+                self.send_error_json(404, "验片单不存在")
+                return
+            cur = json.loads(row["data"] or "{}")
+            frozen = cur.get("frozen") or {}
+            frozen_reels = frozen.get("reels") or []
+
+            # 冻结快照与卷序不可被改写；以快照卷为准逐卷对齐提交数据
+            if len(clean["reels"]) != len(frozen_reels):
+                self.send_error_json(409, "提交卷数与冻结快照不一致（快照不可修改）")
+                return
+            for i, fr in enumerate(frozen_reels):
+                if clean["reels"][i]["reelId"] != fr.get("id"):
+                    self.send_error_json(409, "卷序与冻结快照不一致（快照不可修改）")
+                    return
+
+            cur_reels = cur.get("reels") or []
+            by_id = {r.get("reelId"): r for r in cur_reels if isinstance(r, dict)}
+            new_reels = []
+            for nr in clean["reels"]:
+                old = by_id.get(nr["reelId"]) or {"status": "pending", "findings": []}
+                old_status = old.get("status") if old.get("status") in INSPECTION_REEL_STATUSES else "pending"
+                new_status = nr["status"]
+                # 已放行 / 已退回为终态：记录不可改写
+                if old_status in ("released", "returned"):
+                    if new_status != old_status or nr["findings"] != old.get("findings"):
+                        self.send_error_json(
+                            409, "卷「%s」已%s，记录不可改写" %
+                            (next((x.get("title") for x in frozen_reels if x.get("id") == nr["reelId"]), nr["reelId"]),
+                             "放行" if old_status == "released" else "退回"))
+                        return
+                else:
+                    if new_status not in INSPECTION_REEL_TRANSITIONS[old_status]:
+                        self.send_error_json(
+                            409, "不允许的卷状态流转：%s → %s" % (old_status, new_status))
+                        return
+                # 放行闸：仍有未决项时不能放行（服务端复核）
+                if new_status == "released" and old_status != "released":
+                    blockers = [f for f in nr["findings"] if finding_open(f)]
+                    if blockers:
+                        self.send_error_json(
+                            409, "仍有 %d 项未决（需处置并复查通过，或保留待定），不能放行" % len(blockers))
+                        return
+                new_reels.append({
+                    "reelId": nr["reelId"],
+                    "status": new_status,
+                    "findings": nr["findings"],
+                })
+
+            merged = {
+                "id": iid,
+                "planId": row["plan_id"],
+                "name": clean["name"],
+                "inspector": clean["inspector"],
+                "note": clean["note"],
+                "frozen": frozen,
+                "reels": new_reels,
+            }
+            # 全部卷到终态后，单据头部信息也封存
+            existing_all_terminal = cur_reels and all(
+                r.get("status") in ("released", "returned") for r in cur_reels)
+            if existing_all_terminal:
+                merged["name"] = cur.get("name", clean["name"])
+                merged["inspector"] = cur.get("inspector", "")
+                merged["note"] = cur.get("note", "")
+            db.execute(
+                "UPDATE inspections SET name=?, data=?, updated_at=? WHERE id=?",
+                (merged["name"], json.dumps(merged, ensure_ascii=False), now, iid),
+            )
+            row = db.execute("SELECT * FROM inspections WHERE id = ?", (iid,)).fetchone()
+            plan_row = db.execute(
+                "SELECT * FROM plans WHERE id = ?", (row["plan_id"],)).fetchone()
+        self.send_json(row_to_inspection(
+            row,
+            plan_row["updated_at"] if plan_row else None,
+            plan_content_hash(plan_row) if plan_row else None))
+
     def do_DELETE(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path.startswith("/api/inspections/"):
+            iid = path[len("/api/inspections/"):]
+            with _db_lock, get_db() as db:
+                row = db.execute("SELECT data FROM inspections WHERE id = ?", (iid,)).fetchone()
+                if not row:
+                    self.send_error_json(404, "验片单不存在")
+                    return
+                data = json.loads(row["data"] or "{}")
+                terminal = [r for r in (data.get("reels") or [])
+                            if r.get("status") in ("released", "returned")]
+                if terminal:
+                    self.send_error_json(409, "已有 %d 卷放行或退回，验片单不可删除" % len(terminal))
+                    return
+                db.execute("DELETE FROM inspections WHERE id = ?", (iid,))
+            self.send_json({"ok": True})
+            return
         if path.startswith("/api/rehearsals/"):
             rid = path[len("/api/rehearsals/"):]
             with _db_lock, get_db() as db:

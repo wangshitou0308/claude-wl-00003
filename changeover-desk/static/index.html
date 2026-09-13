@@ -40,6 +40,7 @@
     <button id="btnImport" class="btn">导入 JSON</button>
     <button id="btnExport" class="btn btn-primary">导出 JSON</button>
     <button id="btnRehearsal" class="btn btn-accent">实地排练</button>
+    <button id="btnInspection" class="btn btn-accent">拷贝验片</button>
     <button id="btnPrint" class="btn btn-accent">打印换机提示单</button>
     <input id="fileInput" type="file" accept="application/json,.json" hidden>
   </div>
@@ -249,6 +250,82 @@
   </div>
 </div>
 
+<!-- ================= 拷贝验片视图 ================= -->
+<div id="inspectionView" class="inspection-view" hidden>
+  <header class="iv-top">
+    <div class="rh-brand">拷贝验片</div>
+    <select id="ivSelect" class="rh-select" title="选择本方案的验片单"></select>
+    <button id="ivNew" class="btn btn-sm">＋ 新建验片单</button>
+    <span id="ivStale" class="iv-stale" hidden title="方案在冻结后被修改">快照过期</span>
+    <label class="rh-name-label">验片单
+      <input id="ivName" type="text" maxlength="120" spellcheck="false">
+    </label>
+    <label class="rh-name-label">验片员
+      <input id="ivInspector" type="text" maxlength="80" spellcheck="false" placeholder="签名">
+    </label>
+    <div class="rh-top-actions">
+      <button id="ivCompare" class="btn btn-sm">验片对比</button>
+      <button id="ivExport" class="btn btn-sm">导出 JSON</button>
+      <button id="ivPrint" class="btn btn-sm btn-accent">打印验片放行单</button>
+      <button id="ivDelete" class="btn btn-sm btn-danger">删除</button>
+      <button id="ivClose" class="btn btn-sm">关闭</button>
+    </div>
+  </header>
+
+  <div class="iv-body">
+    <aside class="iv-side">
+      <div id="ivReadiness" class="iv-readiness"></div>
+    </aside>
+
+    <section class="iv-main">
+      <div class="iv-strip-toolbar">
+        <div class="zoom-controls">
+          <button id="ivZoomOut" class="btn btn-sm">－</button>
+          <span id="ivZoomLabel" class="zoom-label">100%</span>
+          <button id="ivZoomIn" class="btn btn-sm">＋</button>
+          <button id="ivZoomFit" class="btn btn-sm">适应</button>
+        </div>
+        <div class="iv-unit-toggle">
+          <span class="muted" style="margin-right:4px">定位刻度</span>
+          <button class="btn btn-sm on" data-unit="ft">英尺</button>
+          <button class="btn btn-sm" data-unit="tc">时间码</button>
+          <button class="btn btn-sm" data-unit="frames">格</button>
+        </div>
+        <div class="legend">
+          <span class="lg"><i style="background:#e8a33d"></i>马达提示窗口</span>
+          <span class="lg"><i style="background:#e05d5d"></i>切换提示窗口</span>
+          <span class="lg"><i style="background:rgba(106,166,224,.5)"></i>片头储备</span>
+          <span class="lg"><i style="background:rgba(79,195,176,.5)"></i>画面段</span>
+          <span class="lg" style="color:var(--text-faint)">▲未决　○已决　拖动平移，Ctrl+滚轮缩放</span>
+        </div>
+      </div>
+      <div id="ivStripScroll" class="iv-strip-scroll">
+        <svg id="ivStrip" class="iv-strip-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+    </section>
+
+    <aside class="iv-right" id="ivRight"></aside>
+  </div>
+</div>
+
+<!-- ================= 验片对比弹窗 ================= -->
+<div id="ivCompareModal" class="modal" hidden>
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <h2>验片对比（同一卷多次验片）</h2>
+      <button class="modal-close" data-close="ivCompareModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">勾选两张或更多验片单，对照同一卷问题的严重程度、处置与复查变化。</p>
+      <div id="ivComparePick" class="compare-pick"></div>
+      <div class="rh-compare-actions">
+        <button id="ivCompareExport" class="btn btn-sm">导出所选 JSON</button>
+      </div>
+      <div id="ivCompareWrap" class="compare-wrap iv-compare-wrap"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ================= 热键设置弹窗 ================= -->
 <div id="rhHotkeyModal" class="modal" hidden>
   <div class="modal-card">
@@ -287,5 +364,6 @@
 <script src="/static/engine.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/rehearsal.js"></script>
+<script src="/static/inspection.js"></script>
 </body>
 </html>
