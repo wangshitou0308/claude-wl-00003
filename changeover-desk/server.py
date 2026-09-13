@@ -15,6 +15,12 @@
   PUT  /api/plans/<id>         -> 更新方案（整体覆盖）
   DELETE /api/plans/<id>       -> 删除方案
   POST /api/plans/bulk         -> 批量导入（返回去重后的入库结果）
+
+  GET  /api/rehearsals?planId= -> 排练记录列表（可按方案过滤）
+  GET  /api/rehearsals/<id>    -> 单条排练记录（含冻结目标与全部实录）
+  POST /api/rehearsals         -> 新建排练（ready，冻结方案卷序与目标时刻）
+  PUT  /api/rehearsals/<id>    -> 更新排练（状态机校验；completed 拒绝改写）
+  DELETE /api/rehearsals/<id>  -> 删除排练（completed 拒绝删除）
 """
 
 import json
@@ -23,7 +29,7 @@ import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -52,6 +58,22 @@ def init_db():
                 updated_at  INTEGER NOT NULL
             )
             """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rehearsals (
+                id          TEXT PRIMARY KEY,
+                plan_id     TEXT NOT NULL,
+                name        TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'ready',
+                data        TEXT NOT NULL DEFAULT '{}',
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            )
+            """
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rehearsals_plan ON rehearsals(plan_id)"
         )
 
 
@@ -97,6 +119,85 @@ def validate_payload(payload):
         "settings": settings or {},
         "reels": reels,
     }, None
+
+
+# ---------------------------------------------------------------- 排练记录
+
+REHEARSAL_STATUSES = ("ready", "running", "paused", "completed")
+
+# 状态机：ready→running⇄paused→completed；completed 为终态，不可改写
+REHEARSAL_TRANSITIONS = {
+    "ready": ("ready", "running"),
+    "running": ("running", "paused", "completed"),
+    "paused": ("paused", "running", "completed"),
+    "completed": (),
+}
+
+
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_rehearsal(payload):
+    """轻量校验：结构合法即可，业务语义由前端负责。"""
+    if not isinstance(payload, dict):
+        return None, "请求体不是 JSON 对象"
+    plan_id = str(payload.get("planId") or "").strip()
+    if not plan_id:
+        return None, "缺少 planId"
+    status = str(payload.get("status") or "ready")
+    if status not in REHEARSAL_STATUSES:
+        return None, "非法排练状态：" + status
+    data = {
+        "id": str(payload.get("id") or "")[:80],
+        "planId": plan_id,
+        "name": str(payload.get("name") or "排练")[:120],
+        "status": status,
+        "startReelIdx": _as_int(payload.get("startReelIdx")) or 0,
+        "hotkeys": payload.get("hotkeys") if isinstance(payload.get("hotkeys"), dict) else {},
+        "frozen": payload.get("frozen") if isinstance(payload.get("frozen"), dict) else {},
+        "startedAt": _as_int(payload.get("startedAt")),
+        "accumPausedMs": _as_int(payload.get("accumPausedMs")) or 0,
+        "pausedAt": _as_int(payload.get("pausedAt")),
+        "completedAt": _as_int(payload.get("completedAt")),
+        "marks": payload.get("marks") if isinstance(payload.get("marks"), list) else [],
+        "flags": payload.get("flags") if isinstance(payload.get("flags"), dict) else {},
+    }
+    return data, None
+
+
+def row_to_rehearsal(row):
+    data = json.loads(row["data"] or "{}")
+    data["id"] = row["id"]
+    data["planId"] = row["plan_id"]
+    data["name"] = row["name"]
+    data["status"] = row["status"]
+    data["createdAt"] = row["created_at"]
+    data["updatedAt"] = row["updated_at"]
+    return data
+
+
+def rehearsal_summary(row):
+    data = json.loads(row["data"] or "{}")
+    frozen = data.get("frozen") or {}
+    return {
+        "id": row["id"],
+        "planId": row["plan_id"],
+        "name": row["name"],
+        "status": row["status"],
+        "startReelIdx": data.get("startReelIdx") or 0,
+        "reelCount": len(frozen.get("reels") or []),
+        "actionCount": len(frozen.get("actions") or []),
+        "markCount": len(data.get("marks") or []),
+        "flags": data.get("flags") or {},
+        "startedAt": data.get("startedAt"),
+        "completedAt": data.get("completedAt"),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
 
 
 # ---------------------------------------------------------------- HTTP 处理
@@ -183,6 +284,28 @@ class Handler(BaseHTTPRequestHandler):
                 rows = db.execute("SELECT * FROM plans ORDER BY updated_at DESC").fetchall()
             self.send_json([plan_summary(r) for r in rows])
             return
+        if path == "/api/rehearsals":
+            qs = parse_qs(parsed.query)
+            plan_id = qs.get("planId", [None])[0]
+            with _db_lock, get_db() as db:
+                if plan_id:
+                    rows = db.execute(
+                        "SELECT * FROM rehearsals WHERE plan_id = ? ORDER BY created_at ASC",
+                        (plan_id,)).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT * FROM rehearsals ORDER BY updated_at DESC").fetchall()
+            self.send_json([rehearsal_summary(r) for r in rows])
+            return
+        if path.startswith("/api/rehearsals/"):
+            rid = path[len("/api/rehearsals/"):]
+            with _db_lock, get_db() as db:
+                row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
+            if not row:
+                self.send_error_json(404, "排练记录不存在")
+                return
+            self.send_json(row_to_rehearsal(row))
+            return
         if path.startswith("/api/plans/"):
             pid = path[len("/api/plans/"):]
             with _db_lock, get_db() as db:
@@ -251,11 +374,48 @@ class Handler(BaseHTTPRequestHandler):
                     saved.append(pid)
             self.send_json({"saved": saved, "skipped": skipped})
             return
+        if path == "/api/rehearsals":
+            clean, err = validate_rehearsal(payload)
+            if err:
+                self.send_error_json(400, err)
+                return
+            # 新建一律从 ready 开始，冻结数据以本次提交为准
+            clean["status"] = "ready"
+            clean["marks"] = []
+            clean["flags"] = {}
+            clean["startedAt"] = None
+            clean["pausedAt"] = None
+            clean["completedAt"] = None
+            clean["accumPausedMs"] = 0
+            rid = clean["id"] or f"reh_{int(time.time()*1000)}"
+            clean["id"] = rid
+            now = int(time.time() * 1000)
+            with _db_lock, get_db() as db:
+                plan = db.execute("SELECT 1 FROM plans WHERE id = ?",
+                                  (clean["planId"],)).fetchone()
+                if not plan:
+                    self.send_error_json(404, "关联方案不存在")
+                    return
+                if db.execute("SELECT 1 FROM rehearsals WHERE id = ?", (rid,)).fetchone():
+                    self.send_error_json(409, "排练 ID 已存在")
+                    return
+                db.execute(
+                    "INSERT INTO rehearsals (id, plan_id, name, status, data, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (rid, clean["planId"], clean["name"], "ready",
+                     json.dumps(clean, ensure_ascii=False), now, now),
+                )
+                row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
+            self.send_json(row_to_rehearsal(row), 201)
+            return
         self.send_error_json(404, "未知路径")
 
     def do_PUT(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path.startswith("/api/rehearsals/"):
+            self.update_rehearsal(path[len("/api/rehearsals/"):])
+            return
         if not path.startswith("/api/plans/"):
             self.send_error_json(404, "未知路径")
             return
@@ -284,9 +444,70 @@ class Handler(BaseHTTPRequestHandler):
             row = db.execute("SELECT * FROM plans WHERE id = ?", (pid,)).fetchone()
         self.send_json(row_to_plan(row))
 
+    def update_rehearsal(self, rid):
+        payload = self.read_json()
+        if payload is None:
+            self.send_error_json(400, "JSON 解析失败")
+            return
+        clean, err = validate_rehearsal(payload)
+        if err:
+            self.send_error_json(400, err)
+            return
+        now = int(time.time() * 1000)
+        with _db_lock, get_db() as db:
+            row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
+            if not row:
+                self.send_error_json(404, "排练记录不存在")
+                return
+            cur_status = row["status"]
+            cur = json.loads(row["data"] or "{}")
+            if cur_status == "completed":
+                self.send_error_json(409, "排练已完成，记录不可改写")
+                return
+            new_status = clean["status"]
+            if new_status not in REHEARSAL_TRANSITIONS[cur_status]:
+                self.send_error_json(
+                    409, "不允许的状态流转：%s → %s" % (cur_status, new_status))
+                return
+            # 冻结的卷序 / 目标时刻与起始卷只在 ready 阶段、且请求显式携带时可改
+            if cur_status != "ready" or "frozen" not in payload:
+                clean["frozen"] = cur.get("frozen", {})
+            if cur_status != "ready" or "startReelIdx" not in payload:
+                clean["startReelIdx"] = cur.get("startReelIdx", 0)
+            clean["id"] = rid
+            clean["planId"] = row["plan_id"]
+            if new_status == "running" and cur_status == "ready" and not clean["startedAt"]:
+                clean["startedAt"] = now
+            if new_status == "paused" and not clean["pausedAt"]:
+                clean["pausedAt"] = now
+            if new_status != "paused":
+                clean["pausedAt"] = None
+            if new_status == "completed" and not clean["completedAt"]:
+                clean["completedAt"] = now
+            db.execute(
+                "UPDATE rehearsals SET name=?, status=?, data=?, updated_at=? WHERE id=?",
+                (clean["name"], new_status,
+                 json.dumps(clean, ensure_ascii=False), now, rid),
+            )
+            row = db.execute("SELECT * FROM rehearsals WHERE id = ?", (rid,)).fetchone()
+        self.send_json(row_to_rehearsal(row))
+
     def do_DELETE(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path.startswith("/api/rehearsals/"):
+            rid = path[len("/api/rehearsals/"):]
+            with _db_lock, get_db() as db:
+                row = db.execute("SELECT status FROM rehearsals WHERE id = ?", (rid,)).fetchone()
+                if not row:
+                    self.send_error_json(404, "排练记录不存在")
+                    return
+                if row["status"] == "completed":
+                    self.send_error_json(409, "排练已完成，记录不可删除")
+                    return
+                db.execute("DELETE FROM rehearsals WHERE id = ?", (rid,))
+            self.send_json({"ok": True})
+            return
         if not path.startswith("/api/plans/"):
             self.send_error_json(404, "未知路径")
             return

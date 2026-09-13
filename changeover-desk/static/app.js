@@ -147,16 +147,17 @@
   }
 
   /* ------------------------------------------------ 保存 */
-  var scheduleSave = debounce(function () {
-    if (!state.plan) return;
+  function saveNow() {
+    if (!state.plan) return Promise.resolve();
     setSaveState("saving", "保存中…");
     state.plan.name = $("#planName").value || "未命名方案";
-    api("/api/plans/" + state.plan.id, jsonOpts("PUT", state.plan))
+    return api("/api/plans/" + state.plan.id, jsonOpts("PUT", state.plan))
       .then(function (saved) {
         setSaveState("saved", "已保存 " + new Date(saved.updatedAt).toLocaleTimeString());
       })
       .catch(function (err) { setSaveState("error", "保存失败：" + err.message); });
-  }, 600);
+  }
+  var scheduleSave = debounce(saveNow, 600);
 
   function touch() {
     if (state.plan) state.plan.updatedAt = Date.now();
@@ -1109,6 +1110,7 @@
       m.addEventListener("pointerdown", function (ev) { if (ev.target === m) m.hidden = true; });
     });
     document.addEventListener("keydown", function (ev) {
+      if (document.body.classList.contains("rehearsal-open")) return;
       if (ev.code === "Space" && !/INPUT|TEXTAREA|SELECT|BUTTON/.test(document.activeElement.tagName)) {
         ev.preventDefault(); togglePlay();
       }
@@ -1379,6 +1381,16 @@
       "<style>.tc{font-size:8pt;color:#444}</style>";
     window.print();
   }
+
+  /* ------------------------------------------------ 实地排练模块桥接 */
+  window.COD = {
+    getPlan: function () { return state.plan; },
+    api: api,
+    jsonOpts: jsonOpts,
+    downloadBlob: downloadBlob,
+    flushSave: saveNow,
+    esc: esc,
+  };
 
   boot();
 })();

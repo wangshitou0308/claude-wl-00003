@@ -39,6 +39,7 @@
     <button id="btnCompare" class="btn">比较方案</button>
     <button id="btnImport" class="btn">导入 JSON</button>
     <button id="btnExport" class="btn btn-primary">导出 JSON</button>
+    <button id="btnRehearsal" class="btn btn-accent">实地排练</button>
     <button id="btnPrint" class="btn btn-accent">打印换机提示单</button>
     <input id="fileInput" type="file" accept="application/json,.json" hidden>
   </div>
@@ -172,10 +173,119 @@
   </div>
 </div>
 
+<!-- ================= 实地排练视图 ================= -->
+<div id="rehearsalView" class="rehearsal-view" hidden>
+  <header class="rh-top">
+    <div class="rh-brand">实地排练</div>
+    <select id="rhSelect" class="rh-select" title="选择本方案的排练记录"></select>
+    <button id="rhNew" class="btn btn-sm">＋ 新建排练</button>
+    <span id="rhStatus" class="rh-status">—</span>
+    <label class="rh-name-label">排练名
+      <input id="rhName" type="text" maxlength="120" spellcheck="false">
+    </label>
+    <div class="rh-top-actions">
+      <button id="rhHotkeys" class="btn btn-sm" title="设置四个动作的记录热键">热键设置</button>
+      <button id="rhCompare" class="btn btn-sm" title="并排比较本方案的多次排练">排练对比</button>
+      <button id="rhExport" class="btn btn-sm">导出 JSON</button>
+      <button id="rhPrint" class="btn btn-sm">打印复盘单</button>
+      <button id="rhDelete" class="btn btn-sm btn-danger">删除</button>
+      <button id="rhClose" class="btn btn-sm">关闭</button>
+    </div>
+  </header>
+
+  <div class="rh-body">
+    <aside class="rh-side">
+      <div class="rh-card">
+        <div class="rh-card-label">计划时刻（与提示单一致）</div>
+        <div id="rhClock" class="rh-clock">--:--</div>
+        <div id="rhClockSub" class="rh-card-sub"></div>
+      </div>
+      <div class="rh-card rh-next-card">
+        <div class="rh-card-label">下一动作</div>
+        <div id="rhNextAction" class="rh-next-action">—</div>
+        <div id="rhCountdown" class="rh-countdown"></div>
+      </div>
+      <div class="rh-card">
+        <div class="rh-card-label">上一笔偏差</div>
+        <div id="rhLastDev" class="rh-last-dev">—</div>
+      </div>
+      <div class="rh-rec-buttons">
+        <button class="rh-rec" data-rh-kind="start">
+          <b>启动下一台</b><kbd data-rh-key="start">Q</kbd><span data-rh-next="start"></span>
+        </button>
+        <button class="rh-rec" data-rh-kind="change">
+          <b>切换画面</b><kbd data-rh-key="change">W</kbd><span data-rh-next="change"></span>
+        </button>
+        <button class="rh-rec" data-rh-kind="stop">
+          <b>停机</b><kbd data-rh-key="stop">E</kbd><span data-rh-next="stop"></span>
+        </button>
+        <button class="rh-rec" data-rh-kind="ready">
+          <b>回卷就绪</b><kbd data-rh-key="ready">R</kbd><span data-rh-next="ready"></span>
+        </button>
+      </div>
+      <div class="rh-ctrl">
+        <button id="rhStart" class="btn btn-primary">▶ 开始排练</button>
+        <button id="rhPause" class="btn" hidden>⏸ 暂停</button>
+        <button id="rhUndo" class="btn" hidden>↩ 撤销上一笔</button>
+        <button id="rhComplete" class="btn btn-accent" hidden>■ 完成排练</button>
+      </div>
+      <div class="rh-setup" id="rhSetup">
+        <label class="rh-setup-label">起始位置
+          <select id="rhStartReel"></select>
+        </label>
+        <div class="rh-setup-hint">从所选卷的马达启动时刻起计时；卷序与目标时刻按已保存方案冻结。</div>
+      </div>
+      <div id="rhFlags" class="rh-flags"></div>
+    </aside>
+
+    <section class="rh-main">
+      <div class="rh-timeline-scroll" id="rhTimelineScroll">
+        <svg id="rhTimeline" class="rh-timeline-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="rh-table-wrap">
+        <table class="rh-table" id="rhTable"></table>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- ================= 热键设置弹窗 ================= -->
+<div id="rhHotkeyModal" class="modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>排练热键设置</h2>
+      <button class="modal-close" data-close="rhHotkeyModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">点击动作后的按键框，再按下要使用的键；四个动作需各不相同。热键随排练记录保存。</p>
+      <div id="rhHotkeyList"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= 排练对比弹窗 ================= -->
+<div id="rhCompareModal" class="modal" hidden>
+  <div class="modal-card modal-wide">
+    <div class="modal-head">
+      <h2>排练对比（同一方案）</h2>
+      <button class="modal-close" data-close="rhCompareModal">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="muted">勾选两次或更多排练，按动作与衔接对照偏差变化；绿色为该次最优。</p>
+      <div id="rhComparePick" class="compare-pick"></div>
+      <div class="rh-compare-actions">
+        <button id="rhCompareExport" class="btn btn-sm">导出所选 JSON</button>
+      </div>
+      <div id="rhCompareWrap" class="compare-wrap"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ================= 打印用换机提示单 ================= -->
 <div id="printSheet" class="print-sheet"></div>
 
 <script src="/static/engine.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/rehearsal.js"></script>
 </body>
 </html>
