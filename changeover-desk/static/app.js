@@ -78,12 +78,35 @@
       if (over) for (var k in over) r[k] = over[k];
       return r;
     }
+    // 甲机旧、性能离散；乙机新、较稳定 —— 用于展示设备差异与时刻窗口
+    var devicesA = {
+      A: {
+        name: "甲机（老珠江）", accelSec: { min: 0.8, max: 1.6 },
+        tailRunoffSec: { min: 2.5, max: 4 }, rewindFactor: { min: 3, max: 4.5 },
+        rethreadSec: { min: 55, max: 90 }, measuredAt: "2026-08-20",
+      },
+      B: {
+        name: "乙机（新东风）", accelSec: { min: 0.7, max: 1.0 },
+        tailRunoffSec: 3, rewindFactor: 5, rethreadSec: { min: 45, max: 60 },
+        measuredAt: "2026-09-05",
+      },
+    };
+    var devicesB = {
+      A: {
+        name: "甲机（老珠江）", accelSec: 1.0, tailRunoffSec: 3,
+        rewindFactor: 4, rethreadSec: 60, measuredAt: "2026-09-10",
+      },
+      B: {
+        name: "乙机（新东风）", accelSec: 0.8, tailRunoffSec: 3,
+        rewindFactor: 5, rethreadSec: 50, measuredAt: "2026-09-10",
+      },
+    };
     var now = Date.now();
     var a = {
       id: "demo_plan_a",
       name: "长空雁叫（1962）排练稿",
-      note: "内置示例：含同机冲突、提前量不足与存疑提示，供检查定位。",
-      settings: E.makeSettings({}),
+      note: "内置示例：含同机冲突、提前量不足、存疑提示与较离散的甲机实测范围。",
+      settings: E.makeSettings({ devices: devicesA }),
       reels: [
         reel(0, "A", 900, { locked: true }),
         reel(1, "B", 930, { motorCue: 120 }),                 // 提前量仅 4 秒
@@ -96,8 +119,8 @@
     var b = {
       id: "demo_plan_b",
       name: "长空雁叫（1962）修正稿",
-      note: "内置示例：严格双机交替、标准提示位置。",
-      settings: E.makeSettings({}),
+      note: "内置示例：严格双机交替、标准提示位置；两机实测均为单值。",
+      settings: E.makeSettings({ devices: devicesB }),
       reels: [
         reel(0, "A", 900, { locked: true }),
         reel(1, "B", 930),
@@ -182,6 +205,7 @@
     renderReelList();
     renderTimeline();
     renderEditor();
+    renderDeviceEditor();
     renderSettings();
     renderIssues();
     renderEventLog();
@@ -192,6 +216,7 @@
     renderReelList();
     renderTimeline();
     updateComputedBox();
+    updateDeviceSummary();
     renderIssues();
     renderEventLog();
     renderSimCards();
@@ -330,6 +355,13 @@
     "</div>";
   }
 
+  // 中点时刻 + 设备实测范围包络（范围不可忽略时才显示）
+  function clockRange(lo, mid, hi) {
+    var s = E.fmtClock(mid);
+    if (hi - lo > 0.05) s += '<div class="comp-range">最早 ' + E.fmtClock(lo) +
+      "　最晚 " + E.fmtClock(hi) + "</div>";
+    return s;
+  }
   function updateComputedBox() {
     var box = $("#computedLines");
     if (!box) return;
@@ -337,26 +369,46 @@
     if (!c) { box.innerHTML = ""; return; }
     var s = state.analysis.settings;
     var headSec = c.headFrames / c.fps;
+    var d = c.dev;
+    var devNote = d.name + "实测";
     var lines = [
       ["画面时长", E.fmtDuration(c.picSec) + "（" + c.picFrames + " 格）"],
       ["含护片总长", E.fmtDuration(c.totalSec)],
       ["马达→切换间隔", E.fmtSigned(c.cueLeadMin, 1) + "～" + E.fmtSigned(c.cueLeadMax, 1) + " 秒"],
       ["片头护片长度", E.fmtSigned(headSec, 1) + " 秒"],
-      ["马达启动", E.fmtClock(c.motorStart)],
-      ["马达提示", E.fmtClock(c.motorCueT)],
-      ["切换提示", E.fmtClock(c.changeCueT)],
+      ["马达启动（起转 " +
+        d.accelSec.min.toFixed(1).replace(/\.0$/, "") +
+        (d.accelSec.hasRange ? "～" + d.accelSec.max.toFixed(1).replace(/\.0$/, "") : "") +
+        "s）", clockRange(c.motorStartLo, c.motorStart, c.motorStartHi)],
+      ["马达提示", clockRange(c.motorCueMin, c.motorCueT, c.motorCueMax)],
+      ["切换提示", clockRange(c.changeCueMin, c.changeCueT, c.changeCueMax)],
       ["画面放完", E.fmtClock(c.picEnd)],
-      ["停机", E.fmtClock(c.stopTime)],
-      ["回卷就绪", E.fmtClock(c.threadedFor)],
+      ["停机（拖尾 " +
+        d.tailRunoffSec.min.toFixed(1).replace(/\.0$/, "") +
+        (d.tailRunoffSec.hasRange ? "～" + d.tailRunoffSec.max.toFixed(1).replace(/\.0$/, "") : "") +
+        "s）", clockRange(c.stopLo, c.stopTime, c.stopHi)],
+      ["回卷就绪（×" +
+        d.rewindFactor.min.toFixed(1).replace(/\.0$/, "") +
+        (d.rewindFactor.hasRange ? "～" + d.rewindFactor.max.toFixed(1).replace(/\.0$/, "") : "") +
+        "／穿片 " +
+        d.rethreadSec.min.toFixed(0) +
+        (d.rethreadSec.hasRange ? "～" + d.rethreadSec.max.toFixed(0) : "") +
+        "s）", c.idx < state.analysis.computed.length - 1
+          ? clockRange(c.threadedLo, c.threadedFor, c.threadedHi) : "—"],
     ];
     if (c.turnaround) {
-      lines.push(["周转余量",
-        '<span style="color:' + (c.turnaround.slack >= 0 ? "var(--teal)" : "var(--red)") + '">' +
-        E.fmtSigned(c.turnaround.slack, 0) + " 秒</span>"]);
+      var t = c.turnaround;
+      var col = t.slackWorst >= 0 ? "var(--teal)" : t.slackBest < 0 ? "var(--red)" : "#e8a33d";
+      lines.push(["周转余量（最不利/中点/最有利）",
+        '<span style="color:' + col + '">' +
+        E.fmtSigned(t.slackWorst, 0) + " / " +
+        E.fmtSigned(t.slack, 0) + " / " +
+        E.fmtSigned(t.slackBest, 0) + " 秒</span>"]);
     }
     box.innerHTML = lines.map(function (l) {
       return '<div class="comp-line"><span>' + l[0] + '</span><b>' + l[1] + "</b></div>";
-    }).join("");
+    }).join("") + '<div class="comp-devnote">' + devNote +
+      (d.measuredAt ? "，测量日期 " + esc(d.measuredAt) : "，<b>未填测量日期</b>") + "</div>";
   }
 
   function flashCueField(cue) {
@@ -403,7 +455,100 @@
     }
   });
 
-  /* ------------------------------------------------ 右：方案设置 */  function renderSettings() {
+  /* ------------------------------------------------ 右：设备实测性能（甲/乙机） */
+  function deviceRaw(which) {
+    var s = state.plan.settings || (state.plan.settings = {});
+    var devs = s.devices || (s.devices = {});
+    if (!devs[which]) devs[which] = E.defaultDevice(which);
+    return devs[which];
+  }
+
+  function renderDeviceEditor() {
+    var box = $("#deviceEditor");
+    if (!state.plan) { box.innerHTML = ""; return; }
+    var a = state.analysis;
+    box.innerHTML =
+      '<div class="device-intro">按甲、乙两台放映机的实测性能分别登记，每项可填' +
+      '<b>单值</b>或<b>最小～最大</b>范围；范围传播到启动、切换、停机、再次就绪时刻，' +
+      "并按最不利组合检查片头储备与周转。改动即时重算，不改变已锁定卷序；" +
+      "新建排练 / 验片时冻结当时版本，旧记录不回写。</div>" +
+      deviceCardHtml("A", a.devices.A) + deviceCardHtml("B", a.devices.B);
+    updateDeviceSummary();
+  }
+
+  function deviceCardHtml(which, resolved) {
+    var raw = deviceRaw(which);
+    var cls = which === "A" ? "device-a" : "device-b";
+    var fields = E.DEVICE_FIELD_KEYS.map(function (k) {
+      var meta = E.DEVICE_FIELDS[k];
+      var vMin = raw[k] == null ? "" : (typeof raw[k] === "object" ? raw[k].min : raw[k]);
+      var vMax = raw[k + "Max"] == null ? "" : raw[k + "Max"];
+      var p = resolved[k];
+      var usingFallback = !p.set;
+      var rangeTxt = p.hasRange
+        ? p.min.toFixed(1).replace(/\.0$/, "") + "～" + p.max.toFixed(1).replace(/\.0$/, "")
+        : p.mid.toFixed(1).replace(/\.0$/, "");
+      return '<div class="device-field" data-devcard="' + which + '" data-devfield="' + k + '">' +
+        '<label>' + meta.label +
+          (p.hasRange ? ' <span class="uncertain-tag">范围</span>' : "") +
+          (usingFallback ? ' <span class="fallback-tag">缺省</span>' : "") +
+        "</label>" +
+        '<div class="range-row">' +
+          '<input type="number" step="' + meta.step + '" min="0" data-dev="' + which + '" data-df="' + k +
+            '" value="' + esc(vMin) + '" placeholder="单值/最小">' +
+          '<span class="tilde">～</span>' +
+          '<input type="number" step="' + meta.step + '" min="0" data-dev="' + which + '" data-df="' + k +
+            'Max" value="' + esc(vMax) + '" placeholder="上限">' +
+        "</div>" +
+        '<div class="device-field-meta">有效：<b data-devsummary="' + k + '">' + rangeTxt + "</b> " +
+          esc(meta.unit) + (usingFallback ? "（沿用方案设置缺省）" : "") + "</div>" +
+      "</div>";
+    }).join("");
+    return '<div class="device-card ' + cls + '">' +
+      '<div class="device-card-head">' +
+        '<input type="text" class="device-name" data-dev="' + which + '" data-df="name" ' +
+          'value="' + esc(raw.name || resolved.name) + '" maxlength="20">' +
+        '<label class="device-date">测量日期 ' +
+          '<input type="date" data-dev="' + which + '" data-df="measuredAt" value="' + esc(raw.measuredAt || "") + '">' +
+        "</label>" +
+      "</div>" + fields + "</div>";
+  }
+
+  // 输入中只刷新「有效值」行，不重绘表单以免丢焦
+  function updateDeviceSummary() {
+    if (!state.analysis) return;
+    ["A", "B"].forEach(function (w) {
+      var d = state.analysis.devices[w];
+      E.DEVICE_FIELD_KEYS.forEach(function (k) {
+        var p = d[k];
+        var card = $('[data-devcard="' + w + '"][data-devfield="' + k + '"]');
+        var node = card ? card.querySelector("[data-devsummary]") : null;
+        if (node) {
+          node.textContent = p.hasRange
+            ? p.min.toFixed(1).replace(/\.0$/, "") + "～" + p.max.toFixed(1).replace(/\.0$/, "")
+            : p.mid.toFixed(1).replace(/\.0$/, "");
+        }
+      });
+    });
+  }
+
+  $("#deviceEditor").addEventListener("input", function (ev) {
+    var f = ev.target.getAttribute && ev.target.getAttribute("data-df");
+    if (!f || !state.plan) return;
+    var w = ev.target.getAttribute("data-dev");
+    var raw = deviceRaw(w);
+    if (ev.target.type === "number") {
+      raw[f] = ev.target.value === "" ? null : parseFloat(ev.target.value);
+    } else {
+      raw[f] = ev.target.value;
+    }
+    touch();
+    // 日期 / 名称变化无需重绘输入框；数值已由 updateDeviceSummary 刷新有效值
+  });
+  $("#deviceEditor").addEventListener("change", function () { /* 与 input 相同，保留以兼容日期控件 */ });
+
+  /* ------------------------------------------------ 右：方案设置 */
+  function renderSettings() {
     var box = $("#settingsEditor");
     if (!state.plan) { box.innerHTML = ""; return; }
     var s = state.analysis.settings;
@@ -425,20 +570,18 @@
         '<option value="head"' + (s.cueRef === "head" ? " selected" : "") + ">距物理片头（护片之后累计）</option>" +
       "</select></div>" +
       '<div class="settings-grid">' +
-        numField("motorLeadSec", "首卷马达提前（秒）", "开映前甲机马达启动时刻") +
-        numField("accelSec", "马达加速稳速（秒）", "", 0.5) +
+        numField("motorLeadSec", "首卷马达提前（秒）", "开映前手动启动甲机的最早提前量") +
         numField("minMotorLeadSec", "最小马达提前量（秒）", "马达提示与切换提示间隔下限", 0.5) +
         numField("minHeadReserveSec", "最小片头储备（秒）", "切换瞬间动作片头之前的余量", 0.5) +
         numField("gapToleranceSec", "空档/重叠容差（秒）", "≤容差的重叠视为标准双机接片", 0.5) +
-        numField("tailRunoffSec", "切换后跑片尾（秒）", "到停机之间的时长", 0.5) +
-        numField("laceSec", "挂片时间（秒）", "回卷完成后挂好下一卷") +
-        numField("rewindFactor", "回卷速度倍率", "回卷速度 = 放映速度 × 倍率", 0.5) +
         numField("turnaroundBufferSec", "周转安全余量（秒）", "就绪须早于下一马达启动") +
       "</div>" +
       '<div class="field"><label>回卷方式</label><select data-s="rewindMode">' +
         '<option value="serial"' + (s.rewindMode === "serial" ? " selected" : "") + '>停机后回卷（稳妥，常见于小厅）</option>' +
         '<option value="parallel"' + (s.rewindMode === "parallel" ? " selected" : "") + ">切换后立即回卷（紧凑）</option>" +
       "</select></div>" +
+      '<div class="hint">起转稳定时间、停机拖尾、回卷倍率、重新穿片时长按甲 / 乙机实测值登记，' +
+      "在「设备性能」页填写（支持最小～最大范围）；设备未填实测时沿用旧版全局缺省。</div>" +
       '<div class="field"><label>方案备注</label>' +
         '<textarea rows="3" data-s="note">' + esc(state.plan.note || "") + "</textarea></div>";
   }
@@ -476,7 +619,11 @@
       '<div class="stat-chip doubt"><div class="n">' + st.doubtfulCount + '</div><div class="t">存疑</div></div>' +
       '<div class="stat-chip gap"><div class="n">' + riskTxt(st.totalGap, st.gapRisk, "s") + '</div><div class="t">空档（含存疑）</div></div>' +
       '<div class="stat-chip gap"><div class="n">' + riskTxt(st.totalOverlap, st.overlapRisk, "s") + '</div><div class="t">重叠（含存疑）</div></div>' +
-      '<div class="stat-chip gap"><div class="n">' + E.fmtSigned(st.turnaroundShort, 0) + '</div><div class="t">周转缺口</div></div>';
+      '<div class="stat-chip gap"><div class="n">' + riskTxt(st.turnaroundShort, st.turnaroundRisk, "s") +
+        '</div><div class="t">周转缺口（最不利）</div></div>' +
+      '<div class="stat-chip gap"><div class="n">' +
+        Math.round(st.startWindow) + "/" + Math.round(st.stopWindow) + "/" + Math.round(st.readyWindow) +
+        's</div><div class="t">启动/停机/就绪窗口</div></div>';
     if (!n) {
       list.innerHTML = '<li class="issue-empty">未发现排映冲突。<br>存疑提示仍建议在装片时现场复核。</li>';
       return;
@@ -630,17 +777,27 @@
     // ---- 胶卷块
     a.computed.forEach(function (c) { html.push(reelBlock(c, a)); });
 
-    // ---- 周转连线
+    // ---- 周转连线（就绪最晚 → deadline 最早 为最不利余量；中点连线为主线）
     a.computed.forEach(function (c) {
       if (!c.turnaround) return;
+      var ta = c.turnaround;
       var y = GEO[c.reel.projector === "A" ? "laneA" : "laneB"] + GEO.laneH + 6;
-      var x1 = xOf(c.threadedFor), x2 = xOf(c.turnaround.deadlineT);
-      var col = c.turnaround.slack >= 0 ? "#3f7d72" : "#c45050";
+      // 最不利余量区间（就绪最晚 ～ 须就绪最早）：红/琥珀斜纹
+      var worstBad = ta.slackWorst < 0;
+      if (worstBad) {
+        var xw1 = xOf(ta.readyHi), xw2 = xOf(ta.deadlineLo);
+        html.push(rect(Math.min(xw1, xw2), y - 3, Math.abs(xw2 - xw1) || 2, 6, {
+          fill: ta.slackBest < 0 ? "rgba(224,93,93,.5)" : "rgba(232,163,61,.45)", rx: 2,
+        }));
+      }
+      var col = ta.slackBest < 0 ? "#c45050" : ta.slackWorst < 0 ? "#e8a33d" : "#3f7d72";
+      var x1 = xOf(ta.readyT), x2 = xOf(ta.deadlineT);
       html.push(line(x1, y, Math.max(x1 + 2, x2), y, { stroke: col, "stroke-width": 2.5 }));
       html.push(svgTriangle(x1, y, 4, col, "right"));
       html.push(svgTriangle(Math.max(x1 + 2, x2), y, 4, col, "left"));
-      var label = (c.turnaround.slack >= 0 ? "周转余量 " : "缺 ") +
-        E.fmtSigned(Math.abs(c.turnaround.slack), 0) + "s";
+      var label = (ta.slackWorst >= 0 ? "周转余量≥" :
+        ta.slackBest < 0 ? "缺 " : "可能缺 ") +
+        E.fmtSigned(Math.abs(ta.slackWorst < 0 ? ta.slackWorst : ta.slackBest), 0) + "s";
       if (Math.abs(x2 - x1) > 44)
         html.push(text((x1 + x2) / 2, y - 3, label, {
           fill: col, "font-size": 9, "text-anchor": "middle",
@@ -693,14 +850,32 @@
     h.push(rect(xHead, laneY + 8, Math.max(2, xTailEnd - xHead), GEO.laneH - 16, {
       fill: "none", stroke: "#3b414b", "stroke-width": 0.8, "stroke-dasharray": "3 3", rx: 3,
     }));
+
+    // 设备实测窗口：启动（最早～最晚）与停机（最早～最晚），蓝色虚框
+    var devCol = reel.projector === "A" ? "#6aa6e0" : "#e0a878";
+    if (c.motorStartHi - c.motorStartLo > 0.05) {
+      var xms1 = xOf(c.motorStartLo), xms2 = xOf(c.motorStartHi);
+      h.push(rect(xms1, laneY + 5, Math.max(2, xms2 - xms1), GEO.laneH - 10, {
+        fill: "rgba(106,166,224,.13)", stroke: devCol, "stroke-width": 0.8,
+        "stroke-dasharray": "2 2", rx: 2,
+      }));
+    }
+    if (c.stopHi - c.stopLo > 0.05) {
+      var xst1 = xOf(c.stopLo), xst2 = xOf(c.stopHi);
+      h.push(rect(xst1, laneY + 5, Math.max(2, xst2 - xst1), GEO.laneH - 10, {
+        fill: "rgba(106,166,224,.13)", stroke: devCol, "stroke-width": 0.8,
+        "stroke-dasharray": "2 2", rx: 2,
+      }));
+    }
     // 运行段三段
     h.push(rect(xMotor, laneY + 8, Math.max(1, xPic - xMotor), GEO.laneH - 16, { fill: "#33382f", rx: 2 }));
     h.push(rect(xPic, laneY + 8, Math.max(1, xChg - xPic), GEO.laneH - 16, {
       fill: reel.projector === "A" ? "rgba(91,155,213,.42)" : "rgba(216,140,91,.42)",
     }));
     h.push(rect(xChg, laneY + 8, Math.max(1, xStop - xChg), GEO.laneH - 16, { fill: "#2a2e36", rx: 2 }));
-    // 边框 + 命中区
-    h.push(rect(xMotor, laneY + 8, Math.max(6, xStop - xMotor), GEO.laneH - 16, {
+    // 边框 + 命中区（覆盖设备范围包络）
+    h.push(rect(xOf(c.motorStartLo), laneY + 8,
+      Math.max(6, xOf(c.stopHi) - xOf(c.motorStartLo)), GEO.laneH - 16, {
       fill: "transparent", stroke: selected ? "#e8a33d" : col,
       "stroke-width": selected ? 2 : 1.2, rx: 4,
       "data-reel-block": reel.id, style: "cursor:" + (reel.locked ? "pointer" : "grab"),
@@ -727,8 +902,14 @@
     h.push(cueMarker(c, "motor", laneY));
     h.push(cueMarker(c, "change", laneY));
 
-    // 就绪刻点
+    // 就绪刻点 + 设备窗口（回卷倍率 / 穿片范围传播）
     if (c.idx < analysis.computed.length - 1) {
+      if (c.threadedHi - c.threadedLo > 0.05) {
+        var xr1 = xOf(c.threadedLo), xr2 = xOf(c.threadedHi);
+        h.push(rect(xr1, laneY + GEO.laneH - 12, Math.max(2, xr2 - xr1), 7, {
+          fill: "rgba(79,195,176,.22)", stroke: "#3f7d72", "stroke-width": 0.7, rx: 2,
+        }));
+      }
       var xR = xOf(c.threadedFor);
       h.push(line(xR, laneY + GEO.laneH - 10, xR, laneY + GEO.laneH - 2, { stroke: "#4fc3b0", "stroke-width": 2 }));
     }
@@ -1052,10 +1233,12 @@
     if (!state.analysis) { box.innerHTML = ""; return; }
     var nextId = state.sim.active && nextEvent() ? nextEvent().id : null;
     box.innerHTML = state.analysis.events.map(function (e) {
+      var winTxt = (e.tHi - e.tLo > 0.05)
+        ? '<div class="ev-win">窗口 ' + E.fmtClock(e.tLo) + "～" + E.fmtClock(e.tHi) + "</div>" : "";
       return '<li class="event-row' + (e.id === nextId ? " active" : "") +
         (state.sim.active && e.t <= state.sim.t ? '" style="opacity:.5"' : '"') +
         ' data-event="' + esc(e.id) + '">' +
-        '<span class="ev-t">' + E.fmtClock(e.t) + "</span>" +
+        '<span class="ev-t">' + E.fmtClock(e.t) + winTxt + "</span>" +
         '<span class="ev-k ev-k-' + e.kind + '">' +
         ({ start: "启动", motor: "马达", change: "切换", stop: "停机", ready: "就绪" })[e.kind] + "</span>" +
         '<span class="ev-label">' + esc(e.label) + "</span></li>";
@@ -1238,7 +1421,8 @@
       var errBest = best("errorCount", true), warnBest = best("warningCount", true),
           gapBest = best("totalGap", true), overBest = best("totalOverlap", true),
           gapRiskBest = best("gapRisk", true), overRiskBest = best("overlapRisk", true),
-          turnBest = best("turnaroundShort", true);
+          turnBest = best("turnaroundShort", true),
+          turnRiskBest = best("turnaroundRisk", true);
       var rows = [
         ["卷数", function (r) { return r.stats.reelCount; }, null],
         ["排映总时长", function (r) { return E.fmtDuration(r.stats.showDuration); }, null],
@@ -1249,30 +1433,74 @@
         ["重叠合计", function (r) { return E.fmtSigned(r.stats.totalOverlap, 0) + " s"; }, overBest],
         ["潜在空档（存疑）", function (r) { return E.fmtSigned(r.stats.gapRisk, 0) + " s"; }, gapRiskBest],
         ["潜在重叠（存疑）", function (r) { return E.fmtSigned(r.stats.overlapRisk, 0) + " s"; }, overRiskBest],
-        ["周转缺口", function (r) { return E.fmtSigned(r.stats.turnaroundShort, 0) + " s"; }, turnBest],
+        ["确定性周转缺口", function (r) { return E.fmtSigned(r.stats.turnaroundShort, 0) + " s"; }, turnBest],
+        ["最不利周转缺口", function (r) { return E.fmtSigned(r.stats.turnaroundRisk, 0) + " s"; }, turnRiskBest],
+        ["最紧周转余量（最不利）", function (r) {
+          return r.stats.minSlackWorst == null ? "—" : E.fmtSigned(r.stats.minSlackWorst, 0) + " s";
+        }, null],
+        ["最大 启动/停机/就绪 窗口", function (r) {
+          return Math.round(r.stats.startWindow) + " / " +
+            Math.round(r.stats.stopWindow) + " / " + Math.round(r.stats.readyWindow) + " s";
+        }, null],
         ["机别排列", function (r) {
           return r.reels.map(function (x) { return x.projector === "A" ? "甲" : "乙"; }).join("");
         }, null],
       ];
-      var html = '<table class="compare-table"><thead><tr><th>指标</th>' +
-        results.map(function (r, i) { return "<th>" + esc(plans[i].name) + "</th>"; }).join("") +
-        "</tr></thead><tbody>" + rows.map(function (row) {
-          return "<tr><td>" + row[0] + "</td>" + results.map(function (r, i) {
-            var v = row[1](r);
-            var cls = "";
-            if (row[2]) cls = row[2][i] ? "good" : "";
-            if (typeof v === "number") {
-              if (row[0] === "错误冲突" && v > 0) cls = "bad";
-              if (row[0] === "警告" && v > 0 && !cls) cls = "warn";
-            }
-            if (row[0].indexOf("缺口") >= 0 && v !== "0 s") cls = "bad";
-            if (row[0].indexOf("空档") >= 0 || row[0].indexOf("重叠") >= 0) {
-              if (v !== "0 s" && !cls) cls = row[0].indexOf("存疑") >= 0 ? "warn" : "warn";
-            }
-            return '<td class="' + cls + '">' + esc(v) + "</td>";
-          }).join("") + "</tr>";
-        }).join("") + "</tbody></table>";
-      wrap.innerHTML = html;
+      function statTable() {
+        return '<table class="compare-table"><thead><tr><th>指标</th>' +
+          results.map(function (r, i) { return "<th>" + esc(plans[i].name) + "</th>"; }).join("") +
+          "</tr></thead><tbody>" + rows.map(function (row) {
+            return "<tr><td>" + row[0] + "</td>" + results.map(function (r, i) {
+              var v = row[1](r);
+              var cls = "";
+              if (row[2]) cls = row[2][i] ? "good" : "";
+              if (typeof v === "number") {
+                if (row[0] === "错误冲突" && v > 0) cls = "bad";
+                if (row[0] === "警告" && v > 0 && !cls) cls = "warn";
+              }
+              if (row[0].indexOf("缺口") >= 0 && v !== "0 s") cls = "bad";
+              if (row[0].indexOf("空档") >= 0 || row[0].indexOf("重叠") >= 0) {
+                if (v !== "0 s" && !cls) cls = "warn";
+              }
+              if (row[0].indexOf("最紧周转余量") >= 0 && v !== "—" && r.stats.minSlackWorst < 0) cls = "warn";
+              return '<td class="' + cls + '">' + esc(v) + "</td>";
+            }).join("") + "</tr>";
+          }).join("") + "</tbody></table>";
+      }
+
+      // 设备差异：逐机逐参数对照；列内值在所选方案间不一致时高亮
+      function paramText(d, k) {
+        var p = d[k];
+        var v = p.hasRange
+          ? p.min.toFixed(1).replace(/\.0$/, "") + "～" + p.max.toFixed(1).replace(/\.0$/, "")
+          : p.mid.toFixed(1).replace(/\.0$/, "");
+        return v + " " + E.DEVICE_FIELDS[k].unit;
+      }
+      var devRowsHtml = ["A", "B"].map(function (w) {
+        var lines = [["设备名", function (r) { return r.devices[w].name; }],
+                     ["测量日期", function (r) { return r.devices[w].measuredAt || "（未填）"; }]];
+        E.DEVICE_FIELD_KEYS.forEach(function (k) {
+          lines.push([E.DEVICE_FIELDS[k].label, function (r) { return paramText(r.devices[w], k); }]);
+        });
+        return lines.map(function (ln) {
+          var vals = results.map(ln[1]);
+          var differ = vals.some(function (v) { return String(v) !== String(vals[0]); });
+          return "<tr" + (ln[0] === "设备名" ? ' class="dev-name-row"' : "") + "><td>" +
+            (w === "A" ? "甲机" : "乙机") + " · " + ln[0] + "</td>" +
+            vals.map(function (v, i) {
+              var cls = differ ? "diff" : "";
+              if (ln[0] === "测量日期" && !results[i].devices[w].measuredAt) cls = "bad";
+              return '<td class="' + cls + '">' + esc(v) + "</td>";
+            }).join("") + "</tr>";
+        }).join("");
+      }).join("");
+
+      wrap.innerHTML =
+        statTable() +
+        '<div class="compare-subtitle">设备实测差异（同参数在方案间不同以黄底标出）</div>' +
+        '<table class="compare-table compare-device"><thead><tr><th>设备 / 参数</th>' +
+        plans.map(function (p) { return "<th>" + esc(p.name) + "</th>"; }).join("") +
+        "</tr></thead><tbody>" + devRowsHtml + "</tbody></table>";
     });
   }
 
@@ -1320,11 +1548,27 @@
   }
 
   /* ------------------------------------------------ 打印换机提示单 */
+  function devSummary(d) {
+    function f(k) {
+      var p = d[k];
+      var v = p.hasRange
+        ? p.min.toFixed(1).replace(/\.0$/, "") + "~" + p.max.toFixed(1).replace(/\.0$/, "")
+        : p.mid.toFixed(1).replace(/\.0$/, "");
+      return E.DEVICE_FIELDS[k].label + " " + v;
+    }
+    return (d.name || "") + "（测量 " + (d.measuredAt || "未填") + "）：" +
+      ["accelSec", "tailRunoffSec", "rewindFactor", "rethreadSec"].map(f).join("，");
+  }
+
   function printSheet() {
     if (!state.plan || !state.analysis) return;
     var a = state.analysis, s = a.settings;
     var rows = a.computed.map(function (c, idx) {
-      function cell(t) { return E.fmtClock(t) + "<br><span class='tc'>" + E.fmtTimecode(t, c.fps) + "</span>"; }
+      function cell(t, lo, hi) {
+        var range = (hi - lo > 0.05)
+          ? "<br><span class='tc'>范围 " + E.fmtClock(lo) + " ~ " + E.fmtClock(hi) + "</span>" : "";
+        return E.fmtClock(t) + "<br><span class='tc'>" + E.fmtTimecode(t, c.fps) + "</span>" + range;
+      }
       var doubt = c.motor.uncertain || c.change.uncertain;
       var nx = a.computed[idx + 1];
       var target = nx
@@ -1343,39 +1587,53 @@
           parts.push("存疑空档≤" + E.fmtSigned(gHi, 1) + " s");
         if (gLo < -s.gapToleranceSec && gLo < g)
           parts.push("存疑重叠≤" + E.fmtSigned(-gLo, 1) + " s");
+        if (c.turnaround) {
+          var t = c.turnaround;
+          parts.push("周转 " + E.fmtSigned(t.slackWorst, 0) + "/" +
+            E.fmtSigned(t.slack, 0) + "/" + E.fmtSigned(t.slackBest, 0) + " s");
+        }
         gapTxt = parts.join("；");
       }
       return "<tr>" +
         "<td>" + (c.idx + 1) + "</td>" +
         '<td class="l">' + esc(c.reel.title) + (c.reel.locked ? " 🔒" : "") + "</td>" +
         "<td>" + (c.reel.projector === "A" ? "甲机" : "乙机") + "</td>" +
-        "<td>" + cell(c.motorCueT) + (c.motor.uncertain ? " <b>?</b>" : "") + "</td>" +
-        "<td>" + cell(c.changeCueT) + (c.change.uncertain ? " <b>?</b>" : "") + "</td>" +
+        "<td>" + cell(c.motorCueT, c.motorCueMin, c.motorCueMax) + (c.motor.uncertain ? " <b>?</b>" : "") + "</td>" +
+        "<td>" + cell(c.changeCueT, c.changeCueMin, c.changeCueMax) + (c.change.uncertain ? " <b>?</b>" : "") + "</td>" +
         '<td class="l">' + target + "<br><span class='tc'>" + gapTxt + "</span></td>" +
         "<td>" + E.fmtSigned(c.cueLeadMin, 1) + "–" + E.fmtSigned(c.cueLeadMax, 1) + " s</td>" +
-        "<td>" + cell(c.motorStart) + "</td>" +
-        "<td>" + cell(c.stopTime) + "</td>" +
-        "<td>" + (c.idx < a.computed.length - 1 ? cell(c.threadedFor) : "—") + "</td>" +
+        "<td>" + cell(c.motorStart, c.motorStartLo, c.motorStartHi) + "</td>" +
+        "<td>" + cell(c.stopTime, c.stopLo, c.stopHi) + "</td>" +
+        "<td>" + (c.idx < a.computed.length - 1
+          ? cell(c.threadedFor, c.threadedLo, c.threadedHi) : "—") + "</td>" +
         '<td class="l">' + (doubt ? "<b>提示存疑，装片复核</b>" : esc(c.reel.note || "")) + "</td>" +
         "</tr>";
     }).join("");
 
     var errs = a.issues.filter(function (i) { return i.severity === "error"; });
     var warns = a.issues.filter(function (i) { return i.severity === "warning"; });
+    // 风险变化：按最不利组合列出周转 / 片头条目
+    var riskWarns = a.issues.filter(function (i) {
+      return i.doubtful && (i.kind === "turnaround" || i.kind === "firstHead");
+    });
     $("#printSheet").innerHTML =
       "<h1>换机提示单 · " + esc(state.plan.name) + "</h1>" +
       '<div class="ps-meta">打印时间：' + new Date().toLocaleString() +
         "　默认帧率：" + s.fps + " fps　规格：" + s.gauge +
         "　回卷：" + (s.rewindMode === "serial" ? "停机后回卷" : "切换后回卷") +
-        " ×" + s.rewindFactor +
-        "　提示计量：" + (s.cueRef === "tail" ? "距画面末尾" : "距物理片头") + "</div>" +
+        "　提示计量：" + (s.cueRef === "tail" ? "距画面末尾" : "距物理片头") + "<br>" +
+        "【甲机】" + esc(devSummary(a.devices.A)) + "<br>" +
+        "【乙机】" + esc(devSummary(a.devices.B)) +
+        '<br>时刻范围按设备实测上下限传播；周转余量列依次为 最不利/中点/最有利（秒，负值为缺口）。</div>' +
       (errs.length ? '<div class="ps-warn"><b>开映前必须处理（' + errs.length + '）：</b><br>' +
         errs.map(function (i) { return "· " + esc(i.message); }).join("<br>") + "</div>" : "") +
-      '<div class="ps-section-title">逐卷时刻表（上行 分:秒.十分秒 ／ 下行 时:分:秒:格）</div>' +
+      '<div class="ps-section-title">逐卷时刻表（上行 分:秒.十分秒 ／ 下行 时:分:秒:格；范围为实测包络）</div>' +
       "<table><thead><tr>" +
         "<th>序</th><th>卷次</th><th>机别</th><th>马达提示</th><th>切换提示</th>" +
         "<th>信号目标 / 衔接</th><th>间隔</th><th>马达启动</th><th>停机</th><th>回卷就绪</th><th>备注</th>" +
       "</tr></thead><tbody>" + rows + "</tbody></table>" +
+      (riskWarns.length ? '<div class="ps-section-title">最不利组合风险（随本次实测落点，可能不发生）</div>' +
+        riskWarns.map(function (i) { return "· " + esc(i.message) + "<br>"; }).join("") : "") +
       (warns.length ? '<div class="ps-section-title">现场留意（' + warns.length + '）</div>' +
         warns.map(function (i) { return "· " + esc(i.message) + (i.doubtful ? "（存疑）" : "") + "<br>"; }).join("") : "") +
       '<div class="ps-sign"><span>放映员</span><span>检片员</span><span>值班经理</span></div>' +

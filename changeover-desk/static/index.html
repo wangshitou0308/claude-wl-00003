@@ -77,6 +77,7 @@
         <span class="lg"><i class="lg-gap"></i>空档</span>
         <span class="lg"><i class="lg-overlap"></i>重叠</span>
         <span class="lg"><i class="lg-uncertain"></i>存疑范围</span>
+        <span class="lg"><i class="lg-device"></i>设备窗口</span>
       </div>
     </div>
 
@@ -127,6 +128,7 @@
   <aside class="panel panel-right">
     <div class="tabs">
       <button class="tab tab-active" data-tab="reel">本卷参数</button>
+      <button class="tab" data-tab="device">设备性能</button>
       <button class="tab" data-tab="settings">方案设置</button>
       <button class="tab tab-issues" data-tab="issues">
         冲突检查 <span id="issueBadge" class="badge" hidden>0</span>
@@ -135,6 +137,10 @@
 
     <div class="tab-body" data-body="reel">
       <div id="reelEditor" class="reel-editor"></div>
+    </div>
+
+    <div class="tab-body" data-body="device" hidden>
+      <div id="deviceEditor" class="device-editor"></div>
     </div>
 
     <div class="tab-body" data-body="settings" hidden>

@@ -103,15 +103,27 @@
       });
     }
 
+    // 合并两个来源的窗口：提示存疑（黄框）与设备实测范围（设备窗口）。
+    // 取并集包络；winCue 标记窗口是否含提示存疑，决定偏差判定口径。
+    function mergeWin(devWin, cueWin) {
+      var lo = null, hi = null;
+      if (devWin) { lo = devWin[0]; hi = devWin[1]; }
+      if (cueWin) { lo = lo == null ? cueWin[0] : Math.min(lo, cueWin[0]); hi = hi == null ? cueWin[1] : Math.max(hi, cueWin[1]); }
+      return lo == null ? null : [lo, hi];
+    }
+
     var actions = [];
     for (i = startReelIdx; i < comps.length; i++) {
       c = comps[i];
       var prev = comps[i - 1] || null;
       if (i === startReelIdx) {
+        // 首卷手动启动：窗口仅来自本机起转稳定时间
         actions.push(mkAction("start", c, c.motorStart,
-          "手动启动" + projName(c) + "《" + c.reel.title + "》", null, null));
+          "手动启动" + projName(c) + "《" + c.reel.title + "》",
+          mergeWin([c.motorStartLo, c.motorStartHi], null), null));
       } else {
-        // 启动下一台：听上一卷马达提示；存疑时按提示范围给时间窗口
+        // 启动下一台：听上一卷马达提示；设备起转范围影响本机何时动起来，
+        // 但动作按信号执行，窗口取上一卷马达提示存疑窗（与旧版一致）。
         var mw = prev.motor.uncertain ? [prev.motorCueMin, prev.motorCueMax] : null;
         actions.push(mkAction("start", c, prev.motorCueT,
           "启动" + projName(c) + "《" + c.reel.title + "》（听《" + prev.reel.title + "》马达提示）",
@@ -123,16 +135,19 @@
           ? "终场切灯（《" + c.reel.title + "》切换提示）"
           : "切到" + projName(comps[i + 1]) + "《" + comps[i + 1].reel.title + "》",
         cw, null));
-      // 停机 / 回卷就绪由切换提示推出，切换存疑则窗口同步平移
-      var sw = c.change.uncertain
-        ? [c.stopTime + (c.changeCueMin - c.changeCueT), c.stopTime + (c.changeCueMax - c.changeCueT)]
-        : null;
+      // 停机：切换存疑窗 ∪ 本机停机拖尾实测范围
+      var sw = mergeWin([c.stopLo, c.stopHi],
+        c.change.uncertain
+          ? [c.stopTime + (c.changeCueMin - c.changeCueT), c.stopTime + (c.changeCueMax - c.changeCueT)]
+          : null);
       actions.push(mkAction("stop", c, c.stopTime,
         "停" + projName(c) + "《" + c.reel.title + "》", sw, null));
       if (i < comps.length - 1) {
-        var rw = c.change.uncertain
-          ? [c.threadedFor + (c.changeCueMin - c.changeCueT), c.threadedFor + (c.changeCueMax - c.changeCueT)]
-          : null;
+        // 回卷就绪：回卷倍率/穿片实测范围（parallel 时含切换存疑平移）
+        var rw = mergeWin([c.threadedLo, c.threadedHi],
+          c.change.uncertain && s.rewindMode === "parallel"
+            ? [c.threadedFor + (c.changeCueMin - c.changeCueT), c.threadedFor + (c.changeCueMax - c.changeCueT)]
+            : null);
         actions.push(mkAction("ready", c, c.threadedFor,
           projName(c) + " 回卷挂片就绪（《" + c.reel.title + "》之后）", rw, null));
       }
@@ -142,6 +157,15 @@
     });
     actions.forEach(function (a, idx) { a.seq = idx; });
 
+    // 冻结设备版本（旧记录不回写：新排练才带此字段）
+    function freezeDevice(d) {
+      var out = { name: d.name, measuredAt: d.measuredAt || "" };
+      ["accelSec", "tailRunoffSec", "rewindFactor", "rethreadSec"].forEach(function (k) {
+        out[k] = { min: d[k].min, max: d[k].max, mid: d[k].mid, hasRange: d[k].hasRange };
+      });
+      return out;
+    }
+
     return {
       planId: plan.id,
       planName: plan.name,
@@ -150,7 +174,9 @@
       settings: {
         fps: s.fps, gapToleranceSec: s.gapToleranceSec,
         tailRunoffSec: s.tailRunoffSec, cueRef: s.cueRef,
+        rewindMode: s.rewindMode, turnaroundBufferSec: s.turnaroundBufferSec,
       },
+      devices: { A: freezeDevice(analysis.devices.A), B: freezeDevice(analysis.devices.B) },
       startReelIdx: startReelIdx,
       timeOffset: comps.length ? comps[startReelIdx].motorStart : 0,
       showEnd: actions.length ? actions[actions.length - 1].t : 0,
@@ -511,8 +537,31 @@
       paused: "已暂停 · 继续后时间基准不变",
       completed: "已完成 " + fmtWall(rec.completedAt) + " · 记录已封存",
     };
-    $("#rhClockSub").textContent = sub[rec.status] || "";
+    var devLine = frozenDeviceLine();
+    $("#rhClockSub").innerHTML = esc(sub[rec.status] || "") +
+      (devLine ? '<div class="rh-dev-frozen">设备冻结：' + esc(devLine) + "</div>" : "");
     $("#rhClock").textContent = E.fmtClock(planTime());
+  }
+
+  // 冻结设备版本（新建排练时随方案冻结，旧记录无此字段则不显示）
+  function frozenDeviceLine() {
+    var rec = rh.rec;
+    if (!rec || !rec.frozen || !rec.frozen.devices) return "";
+    function one(w) {
+      var d = rec.frozen.devices[w];
+      if (!d) return "";
+      function v(k) {
+        var p = d[k];
+        if (!p) return "—";
+        return p.hasRange ? p.min.toFixed(1).replace(/\.0$/, "") + "~" + p.max.toFixed(1).replace(/\.0$/, "")
+                          : p.mid.toFixed(1).replace(/\.0$/, "");
+      }
+      return (w === "A" ? "甲机" : "乙机") + " " + (d.name || "") +
+        "（测于 " + (d.measuredAt || "未填") + "，起转 " + v("accelSec") +
+        "s / 拖尾 " + v("tailRunoffSec") + "s / 回卷 ×" + v("rewindFactor") +
+        " / 穿片 " + v("rethreadSec") + "s）";
+    }
+    return one("A") + "　" + one("B");
   }
 
   function renderSetup() {
@@ -752,7 +801,7 @@
       lx += 9 + KIND_LABEL[kind].length * 9.5 + 18;
     });
     html.push('<text x="' + (lx + 4) + '" y="14" fill="#6b7280" font-size="9.5">' +
-      "空心=计划 实心=实录 黄框=存疑窗口</text>");
+      "空心=计划 实心=实录 黄框=提示存疑／设备实测窗口</text>");
 
     // 播放头层
     html.push('<g id="rhPlayhead"><line x1="0" y1="2" x2="0" y2="' + (H - 2) +
@@ -1068,7 +1117,8 @@
       "　开始：" + fmtWall(rec.startedAt) + "　完成：" + fmtWall(rec.completedAt) +
       "　热键：" + ["start", "change", "stop", "ready"].map(function (k) {
         return KIND_LABEL[k] + "=" + keyLabel(hotkeys()[k]);
-      }).join(" ") + "</div>" +
+      }).join(" ") +
+        (rec.frozen.devices ? "<br>设备冻结版本：" + esc(frozenDeviceLine()) : "") + "</div>" +
       '<div class="ps-warn"><b>汇总：</b>计划动作 ' + rec.frozen.actions.length +
       " 项，实录 " + rec.marks.length + " 笔" +
       (st.meanAbs != null ? "，平均 |偏差| " + st.meanAbs.toFixed(2) + " 秒" : "") +
