@@ -81,38 +81,8 @@
     saveTimer: 0,
   };
 
-  /* ------------------------------------------------ 冻结快照 */
-  function buildFrozen(plan) {
-    var analysis = E.analyzePlan(plan);
-    var reels = analysis.computed.map(function (c) {
-      var r = c.reel;
-      return {
-        id: r.id, title: r.title, projector: r.projector,
-        order: c.idx, gauge: r.gauge, fps: c.fps, fpf: c.fpf,
-        lengthUnit: r.lengthUnit, lengthValue: r.lengthValue,
-        headLeaderFt: r.headLeaderFt, tailLeaderFt: r.tailLeaderFt,
-        cueRef: analysis.settings.cueRef,
-        motorCue: r.motorCue, motorCueMax: r.motorCueMax, motorCueU: !!r.motorCueU,
-        changeCue: r.changeCue, changeCueMax: r.changeCueMax, changeCueU: !!r.changeCueU,
-        // 冻结换算结果（自物理片头起的格数）
-        headFrames: c.headFrames, tailFrames: c.tailFrames,
-        picFrames: c.picFrames, totalFrames: c.totalFrames,
-        motorOffMin: c.mOff.min, motorOffMax: c.mOff.max, motorOffMid: c.mOff.mid,
-        motorUncertain: c.motor.uncertain,
-        changeOffMin: c.cOff.min, changeOffMax: c.cOff.max, changeOffMid: c.cOff.mid,
-        changeUncertain: c.change.uncertain,
-      };
-    });
-    return {
-      planId: plan.id,
-      planName: plan.name,
-      planUpdatedAt: plan.updatedAt || null,
-      frozenAt: nowMs(),
-      cueRef: analysis.settings.cueRef,
-      cueTolFt: CUE_TOL_FT,
-      reels: reels,
-    };
-  }
+  /* ------------------------------------------------ 冻结快照（只读）
+   * 快照由后端在新建时从已保存方案生成；前端只读取使用。 */
 
   /* 由冻结参数推导分区边界（全部为自物理片头起的格数） */
   function zonesOf(fr) {
@@ -139,11 +109,55 @@
   /* ------------------------------------------------ 定位换算 */
   function frameToFt(fr, frame) { return frame / fr.fpf; }
   function frameToTc(fr, frame) {
-    // 时间码：第一格画面为 00:00:00:00，护片段为负
+    // 时间码：第一格画面为 00:00:00:00，护片段为负（相对秒，供旧格式与刻度使用）
     return (frame - fr.headFrames) / fr.fps;
   }
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  /* 标准放映时间码 HH:MM:SS:FF（FF 为本卷 fps 下的格号，护片段为负） */
+  function fmtTC(fr, frame) {
+    var fps = Math.max(1, Math.round(fr.fps));
+    var rel = Math.round(frame - fr.headFrames); // 相对画面首格的格数
+    var sign = rel < 0 ? "−" : "";
+    var af = Math.abs(rel);
+    var ff = af % fps;
+    var totalSec = Math.floor(af / fps);
+    var ss = totalSec % 60;
+    var mm = Math.floor(totalSec / 60) % 60;
+    var hh = Math.floor(totalSec / 3600);
+    return sign + pad2(hh) + ":" + pad2(mm) + ":" + pad2(ss) + ":" + pad2(ff);
+  }
+  /* 解析 HH:MM:SS:FF（兼容 MM:SS:FF 与旧的 mm:ss.s / 纯秒），返回相对秒数 */
+  function parseTC(str, fps) {
+    var s = String(str).trim();
+    if (!s) return null;
+    var neg = /^[-−]/.test(s);
+    s = s.replace(/^[-−]/, "");
+    var parts = s.split(":");
+    var sec;
+    if (parts.length === 4) {
+      var h = parseInt(parts[0], 10), m = parseInt(parts[1], 10),
+          rsec = parseInt(parts[2], 10), ff = parseInt(parts[3], 10);
+      if ([h, m, rsec, ff].some(function (x) { return !isFinite(x); })) return null;
+      if (m >= 60 || rsec >= 60 || ff >= fps) return null;
+      sec = h * 3600 + m * 60 + rsec + ff / fps;
+    } else if (parts.length === 3) {
+      var m2 = parseInt(parts[0], 10), s2 = parseInt(parts[1], 10), f2 = parseInt(parts[2], 10);
+      if ([m2, s2, f2].some(function (x) { return !isFinite(x); })) return null;
+      if (s2 >= 60 || f2 >= fps) return null;
+      sec = m2 * 60 + s2 + f2 / fps;
+    } else if (parts.length === 2) {
+      // 旧写法 分:秒（秒可带小数）
+      var m3 = parseFloat(parts[0]), s3 = parseFloat(parts[1]);
+      if (!isFinite(m3) || !isFinite(s3)) return null;
+      sec = m3 * 60 + s3;
+    } else if (parts.length === 1) {
+      sec = parseFloat(parts[0]);
+      if (!isFinite(sec)) return null;
+    } else return null;
+    return neg ? -sec : sec;
+  }
   function posText(fr, frame) {
-    return E.fmtClock(frameToTc(fr, frame)) + " / " +
+    return fmtTC(fr, frame) + " / " +
       frameToFt(fr, frame).toFixed(2) + " ft / " + Math.round(frame) + " 格";
   }
 
@@ -172,10 +186,15 @@
       });
   }
 
+  function recheckPassed(f) {
+    // 以真实复查记录为准：最近一条必须通过；与服务端口径一致，不单看布尔位
+    var rc = f.rechecks && f.rechecks.length ? f.rechecks[f.rechecks.length - 1] : null;
+    return !!(rc && rc.passed);
+  }
   function findingOpen(f) {
     if (f.severity === "info") return false;
     if (!f.disposition || f.disposition === "hold") return true;
-    return !f.recheckPassed;
+    return !recheckPassed(f);
   }
   function openFindings(entry) {
     return (entry.findings || []).filter(findingOpen);
@@ -282,20 +301,17 @@
       .then(function (saved) {
         insp.savedPlan = saved;
         if (!saved.reels.length) { alert("方案还没有胶片卷，无法建立验片单。"); return null; }
-        var frozen = buildFrozen(saved);
-        var sheet = {
+        // 冻结快照由服务端按已保存关联方案生成，客户端不提交卷数据
+        return COD.api("/api/inspections", COD.jsonOpts("POST", {
           id: E.uid("ins"),
           planId: saved.id,
           name: "验片 " + new Date().toLocaleString(),
           inspector: "", note: "",
-          frozen: frozen,
-          reels: frozen.reels.map(function (fr) {
-            return { reelId: fr.id, status: "pending", findings: [] };
-          }),
-        };
-        return COD.api("/api/inspections", COD.jsonOpts("POST", sheet));
+          reels: [],
+        }));
       })
-      .then(function (created) { if (created) return loadList(created.id); });
+      .then(function (created) { if (created) return loadList(created.id); })
+      .catch(function (err) { alert("建立验片单失败：" + err.message); });
   }
 
   function deleteSheet() {
@@ -324,11 +340,17 @@
   /* ------------------------------------------------ 状态流转 */
   function setReelStatus(entry, status) {
     if (!editable()) return;
-    if (reelLocked(frozenById(entry.reelId))) return;
+    var fr = frozenById(entry.reelId);
+    if (!fr || reelLocked(fr)) return;
+    // 待检查卷不得越级放行/退回，须先进入检查流程
+    if (entry.status === "pending" && (status === "released" || status === "returned")) {
+      alert("本卷尚未检查：请先点「开始/继续检查」并登记检查结果后，再决定放行或退回。");
+      return;
+    }
     if (status === "released") {
       var blockers = reelBlockers(entry);
       if (blockers.length) {
-        alert("仍有 " + blockers.length + " 项未决：需完成处置并复查通过（或明确退回本卷），不能放行。");
+        alert("仍有 " + blockers.length + " 项未决：每项处置后都须复查受影响区间并通过（或明确退回本卷），不能放行。");
         return;
       }
     }
@@ -402,10 +424,14 @@
   function setDisposition(f, disp) {
     var fr = frozenById(currentReelId());
     if (!fr || reelLocked(fr)) return;
+    var prevPassed = recheckPassed(f);
     f.disposition = disp;
     f.dispositionAt = nowMs();
-    // 换了处置：复查结论失效，需重新复查受影响区间
+    // 换了处置：旧复查结论对新处置无效，须留下失效记录并重新复查受影响区间
     f.recheckPassed = false;
+    if (disp && prevPassed) {
+      f.rechecks.push({ at: nowMs(), passed: false, note: "处置已更改，须重新复查" });
+    }
     var entry = reelEntry(fr.id);
     if (entry.status === "released" || entry.status === "returned") return;
     entry.status = "action";
@@ -416,7 +442,7 @@
   /* 已处置问题的位置 / 类别 / 程度 / 测量被改动：受影响区间须重新复查 */
   function invalidateRecheck(f) {
     if (insp.draft) return; // 草稿尚未保存，无复查结论可失效
-    if (f.disposition && f.recheckPassed) {
+    if (f.disposition && recheckPassed(f)) {
       f.recheckPassed = false;
       f.rechecks.push({ at: nowMs(), passed: false, note: "参数修改后复查结论失效，需重新复查" });
     }
@@ -616,7 +642,7 @@
         var label;
         if (insp.rulerUnit === "ft") label = (frame / fr.fpf).toFixed(stepFrames >= fr.fpf ? 0 : 1) + "ft";
         else if (insp.rulerUnit === "frames") label = String(Math.round(frame));
-        else label = E.fmtClock(frameToTc(fr, frame));
+        else label = fmtTC(fr, frame);
         h.push('<text x="' + (x + 2) + '" y="' + (rulerY - 2) + '" fill="#7b828c" font-size="9" ' +
           'font-variant-numeric="tabular-nums">' + label + "</text>");
       }
@@ -954,14 +980,22 @@
         ["checking", "开始/继续检查"], ["action", "转待处置"],
         ["released", "✔ 放行本卷"], ["returned", "✖ 退回本卷"],
       ];
+      var isPending = entry.status === "pending";
       html.push('<div class="iv-flow-btns">' + btns.map(function (b) {
         var cls = b[0] === "released" ? "btn-primary" : b[0] === "returned" ? "btn-danger" : "";
-        var dis = b[0] === "released" && blockers.length ? " disabled" : "";
+        var dis = "";
+        // 待检查卷不得越级放行/退回；放行还受未决项闸口限制
+        if (isPending && (b[0] === "released" || b[0] === "returned")) dis = " disabled";
+        if (b[0] === "released" && blockers.length) dis = " disabled";
+        var tail = "";
+        if (b[0] === "released" && isPending) tail = "（需先检查）";
+        else if (b[0] === "released" && blockers.length) tail = "（" + blockers.length + " 项未决）";
+        else if (b[0] === "returned" && isPending) tail = "（需先检查）";
         return '<button class="btn btn-sm ' + cls + '" data-st="' + b[0] + '"' + dis + ">" + b[1] +
-          (b[0] === "released" && blockers.length ? "（" + blockers.length + " 项未决）" : "") + "</button>";
+          tail + "</button>";
       }).join("") + "</div>");
       if (entry.status === "pending")
-        html.push('<div class="iv-hint">在左侧胶片带相应位置点击，即可登记检查结果。</div>');
+        html.push('<div class="iv-hint">待检查卷须先进入「检查中」：在左侧胶片带相应位置点击登记检查结果，或先点「开始/继续检查」。</div>');
     }
     html.push("</div>");
 
@@ -988,9 +1022,9 @@
           '<div class="iv-find-pos">' + (f.from === f.to
             ? Math.round(f.from) + " 格"
             : Math.round(f.from) + "–" + Math.round(f.to) + " 格") +
-          " · " + frameToFt(fr, f.from).toFixed(2) + "ft · " + E.fmtClock(frameToTc(fr, f.from)) + "</div>" +
+          " · " + frameToFt(fr, f.from).toFixed(2) + "ft · " + fmtTC(fr, f.from) + "</div>" +
           (f.disposition ? '<div class="iv-find-disp">处置：' + DISP_LABEL[f.disposition] +
-            (f.recheckPassed ? " · 已复查通过" : " · 待复查") + "</div>" : "") +
+            (recheckPassed(f) ? " · 已复查通过" : " · 待复查") + "</div>" : "") +
           "</li>";
       }).join("") + "</ul>");
     }
@@ -1029,7 +1063,7 @@
     // 定位（英尺/时间码/格任一；这里同时给出三输入框，写格数为主，另两个即时换算）
     h.push('<div class="iv-loc-grid">' +
       locInput("from", "起 · 英尺", frameToFt(fr, f.from).toFixed(3), "ft", locked) +
-      locInput("tc", "起 · 时间码", E.fmtClock(frameToTc(fr, f.from)), "tc", locked) +
+      locInput("tc", "起 · 时间码 HH:MM:SS:FF", fmtTC(fr, f.from), "tc", locked) +
       locInput("fromFrame", "起 · 格", Math.round(f.from), "frames", locked) +
       (mspec.range ? locInput("toFrame", "止 · 格", Math.round(f.to), "frames", locked) : "") +
       "</div>");
@@ -1071,7 +1105,7 @@
       (locked ? " disabled" : "") + " style='margin-top:6px'>" + esc(f.dispositionNote || "") + "</textarea>");
     if (f.disposition)
       h.push('<div class="iv-hint">处置时间：' + (f.dispositionAt ? new Date(f.dispositionAt).toLocaleString() : "—") +
-        (f.recheckPassed ? " · 已复查通过" : " · 处置后须复查受影响区间") + "</div>");
+        (recheckPassed(f) ? " · 已复查通过" : " · 处置后须复查受影响区间") + "</div>");
 
     // 复查记录
     if (f.rechecks && f.rechecks.length) {
@@ -1189,7 +1223,7 @@
     };
     function fillLocs() {
       if (locMap.from) locMap.from.value = frameToFt(fr, target.from).toFixed(3);
-      if (locMap.tc) locMap.tc.value = E.fmtClock(frameToTc(fr, target.from));
+      if (locMap.tc) locMap.tc.value = fmtTC(fr, target.from);
       if (locMap.fromFrame) locMap.fromFrame.value = Math.round(target.from);
       if (locMap.toFrame) locMap.toFrame.value = Math.round(target.to);
     }
@@ -1211,8 +1245,13 @@
       afterLocChange();
     };
     if (locMap.tc) locMap.tc.onchange = function () {
-      var sec = parseClock(this.value);
-      if (sec == null) { fillLocs(); return; }
+      var sec = parseTC(this.value, Math.max(1, Math.round(fr.fps)));
+      if (sec == null) {
+        fillLocs();
+        this.classList.add("iv-input-err");
+        return;
+      }
+      this.classList.remove("iv-input-err");
       target.from = clamp(Math.round(sec * fr.fps + fr.headFrames), 0, fr.totalFrames);
       if (KIND_MEASURE[target.kind].range === false) target.to = target.from;
       afterLocChange();
@@ -1244,14 +1283,6 @@
         }
       };
     });
-  }
-
-  /* mm:ss.s / -mm:ss.s 解析（时间码定位框） */
-  function parseClock(str) {
-    var m = String(str).trim().match(/^(-?)(?:(\d+):)?(\d+(?:\.\d+)?)$/);
-    if (!m) return null;
-    var v = (m[2] ? parseInt(m[2], 10) * 60 : 0) + parseFloat(m[3]);
-    return m[1] === "-" ? -v : v;
   }
 
   /* ------------------------------------------------ 多次验片对比 */
@@ -1321,7 +1352,7 @@
             html.push('<td class="' + (open ? "warn" : "good") + '">' +
               SEVERITY_LABEL[f.severity] +
               (f.disposition ? "<br>" + DISP_LABEL[f.disposition] : "") +
-              (f.recheckPassed ? "<br>✓复查" : open ? "<br>未决" : "") + "</td>");
+              (recheckPassed(f) ? "<br>✓复查" : open ? "<br>未决" : "") + "</td>");
           });
           html.push("</tr>");
         });
@@ -1364,8 +1395,8 @@
       else if (cm[k].disposition !== pm[k].disposition)
         out.push({ type: "chg", text: KIND_LABEL[cm[k].kind] + " 改处置：" +
           (DISP_LABEL[cm[k].disposition] || "无") });
-      else if (cm[k].recheckPassed !== pm[k].recheckPassed)
-        out.push({ type: "ok", text: KIND_LABEL[cm[k].kind] + (cm[k].recheckPassed ? " 已复查" : " 复查失效") });
+      else if (recheckPassed(cm[k]) !== recheckPassed(pm[k]))
+        out.push({ type: "ok", text: KIND_LABEL[cm[k].kind] + (recheckPassed(cm[k]) ? " 已复查" : " 复查失效") });
     });
     Object.keys(cm).forEach(function (k) {
       if (!pm[k]) out.push({ type: "new", text: "新登记「" + KIND_LABEL[cm[k].kind] + "」" });
@@ -1406,14 +1437,14 @@
         var zone = ZONE_LABEL[classifyZone(fr, Math.round((f.from + f.to) / 2))];
         return "<tr>" +
           "<td>" + (f.from === f.to ? Math.round(f.from) : Math.round(f.from) + "–" + Math.round(f.to)) + "</td>" +
-          "<td>" + E.fmtClock(frameToTc(fr, f.from)) + "</td>" +
+          "<td>" + fmtTC(fr, f.from) + "</td>" +
           "<td>" + KIND_LABEL[f.kind] + "</td>" +
           "<td>" + SEVERITY_LABEL[f.severity] + "</td>" +
           "<td>" + zone + "</td>" +
           "<td>" + measureText(f) + "</td>" +
           '<td class="l">' + esc(f.note || "") + "</td>" +
           "<td>" + (f.disposition ? DISP_LABEL[f.disposition] : "—") + "</td>" +
-          "<td>" + (f.recheckPassed ? "通过" : findingOpen(f) ? "未决" : "—") + "</td>" +
+          "<td>" + (recheckPassed(f) ? "通过" : findingOpen(f) ? "未决" : "—") + "</td>" +
           "</tr>";
       }).join("");
       if (!rows) rows = '<tr><td colspan="9" class="iv-print-empty">本卷检查未见异常</td></tr>';

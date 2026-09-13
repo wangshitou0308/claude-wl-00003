@@ -226,9 +226,12 @@ def rehearsal_summary(row):
 
 INSPECTION_REEL_STATUSES = ("pending", "checking", "action", "released", "returned")
 
-# 逐卷状态机：已放行 / 已退回为终态；其余可自由流转
+# 逐卷状态机：
+#   pending 待检查 → 只能先进入检查中 / 待处置（不得越级放行或退回）
+#   checking 检查中 / action 待处置 → 可放行或退回
+#   released 已放行 / returned 已退回为终态
 INSPECTION_REEL_TRANSITIONS = {
-    "pending":  ("pending", "checking", "action", "released", "returned"),
+    "pending":  ("pending", "checking", "action"),
     "checking": ("checking", "action", "pending", "released", "returned"),
     "action":   ("action", "checking", "pending", "released", "returned"),
     "released": ("released",),
@@ -238,6 +241,99 @@ INSPECTION_REEL_TRANSITIONS = {
 FINDING_KINDS = ("splice", "perf", "scratch", "shrink", "headtail", "cue")
 FINDING_SEVERITIES = ("info", "minor", "major", "critical")
 DISPOSITIONS = ("clean", "resplice", "replaceLeader", "remark", "hold", "")
+
+INSPECTION_FRAMES_PER_FOOT = {"35mm": 16, "16mm": 40, "8mm": 80, "super8": 72}
+INSPECTION_CUE_TOL_FT = 1
+
+
+def _plan_settings(plan):
+    settings = plan.get("settings") if isinstance(plan, dict) else None
+    if not isinstance(settings, dict):
+        settings = {}
+    return {
+        "fps": float(settings.get("fps") or 24) or 24,
+        "gauge": settings.get("gauge") if settings.get("gauge") in INSPECTION_FRAMES_PER_FOOT else "35mm",
+        "cueRef": "head" if settings.get("cueRef") == "head" else "tail",
+        "headLeaderFt": float(settings.get("headLeaderFt")) if _is_num(settings.get("headLeaderFt")) else 12,
+        "tailLeaderFt": float(settings.get("tailLeaderFt")) if _is_num(settings.get("tailLeaderFt")) else 4,
+    }
+
+
+def _is_num(v):
+    try:
+        return isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _norm_range(v_min, v_max, uncertain):
+    """对应 engine.normRange，返回 (min,max,mid,uncertain)。"""
+    lo = float(v_min) if _is_num(v_min) else 0.0
+    hi = float(v_max) if _is_num(v_max) else lo
+    if lo > hi:
+        lo, hi = hi, lo
+    return lo, hi, (lo + hi) / 2.0, bool(uncertain) or hi != lo
+
+
+def freeze_plan(plan):
+    """由已保存换卷方案生成权威冻结快照（与 engine.js 换算口径一致）。
+
+    前端提交的 frozen 一律不采信，防止伪造卷数据写入快照。
+    """
+    settings = _plan_settings(plan)
+    raw = plan.get("reels") if isinstance(plan.get("reels"), list) else []
+    reels = []
+    for idx, rr in enumerate(raw):
+        if not isinstance(rr, dict):
+            rr = {}
+        fps = float(rr.get("fps")) if _is_num(rr.get("fps")) and float(rr.get("fps")) > 0 else settings["fps"]
+        gauge = rr.get("gauge") if rr.get("gauge") in INSPECTION_FRAMES_PER_FOOT else settings["gauge"]
+        fpf = INSPECTION_FRAMES_PER_FOOT[gauge]
+        unit = rr.get("lengthUnit") if rr.get("lengthUnit") in ("ft", "m", "sec", "frames") else "ft"
+        lv = float(rr.get("lengthValue")) if _is_num(rr.get("lengthValue")) else 0.0
+        if unit == "frames":
+            pic = max(0, round(lv))
+        elif unit == "sec":
+            pic = max(0, round(lv * fps))
+        elif unit == "m":
+            pic = max(0, round((lv / 0.3048) * fpf))
+        else:
+            pic = max(0, round(lv * fpf))
+        head_ft = float(rr.get("headLeaderFt")) if _is_num(rr.get("headLeaderFt")) else settings["headLeaderFt"]
+        tail_ft = float(rr.get("tailLeaderFt")) if _is_num(rr.get("tailLeaderFt")) else settings["tailLeaderFt"]
+        head_fr = round(head_ft * fpf)
+        tail_fr = round(tail_ft * fpf)
+        total = head_fr + pic + tail_fr
+
+        mlo, mhi, mmid, munc = _norm_range(rr.get("motorCue"), rr.get("motorCueMax"), rr.get("motorCueU"))
+        clo, chi, cmid, cunc = _norm_range(rr.get("changeCue"), rr.get("changeCueMax"), rr.get("changeCueU"))
+        if settings["cueRef"] == "head":
+            mo = (mlo, mhi, mmid)
+            co = (clo, chi, cmid)
+        else:
+            mo = (head_fr + pic - mhi, head_fr + pic - mlo, head_fr + pic - mmid)
+            co = (head_fr + pic - chi, head_fr + pic - clo, head_fr + pic - cmid)
+        reels.append({
+            "id": str(rr.get("id") or ""),
+            "title": str(rr.get("title") or ("第 %d 卷" % (idx + 1))),
+            "projector": "B" if rr.get("projector") == "B" else "A",
+            "order": idx, "gauge": gauge, "fps": fps, "fpf": fpf,
+            "lengthUnit": unit, "lengthValue": lv,
+            "headLeaderFt": head_ft, "tailLeaderFt": tail_ft, "cueRef": settings["cueRef"],
+            "motorCue": rr.get("motorCue"), "motorCueMax": rr.get("motorCueMax"),
+            "motorCueU": bool(rr.get("motorCueU")),
+            "changeCue": rr.get("changeCue"), "changeCueMax": rr.get("changeCueMax"),
+            "changeCueU": bool(rr.get("changeCueU")),
+            "headFrames": head_fr, "tailFrames": tail_fr,
+            "picFrames": pic, "totalFrames": total,
+            "motorOffMin": mo[0], "motorOffMax": mo[1], "motorOffMid": mo[2], "motorUncertain": munc,
+            "changeOffMin": co[0], "changeOffMax": co[1], "changeOffMid": co[2], "changeUncertain": cunc,
+        })
+    return {
+        "cueRef": settings["cueRef"],
+        "cueTolFt": INSPECTION_CUE_TOL_FT,
+        "reels": reels,
+    }
 
 
 def _as_num(v):
@@ -249,14 +345,29 @@ def _as_num(v):
 
 
 def finding_open(f):
-    """未决判定：非 info 问题必须有处置且复查通过；hold（保留待定）始终未决。"""
+    """未决判定：非 info 问题必须有处置，且处置后有真实复查通过记录。
+
+    hold（保留待定）始终未决；仅凭客户端的 recheckPassed 布尔位不算数，
+    必须存在 rechecks 中最近一条 passed=true 的复查记录。
+    """
     sev = f.get("severity")
     if sev == "info":
         return False
     disp = f.get("disposition") or ""
     if disp == "hold" or disp not in DISPOSITIONS or disp == "":
         return True
-    return not f.get("recheckPassed")
+    return not recheck_passed(f)
+
+
+def recheck_passed(f):
+    """以最近一条复查记录为准：必须确有复查且通过。"""
+    rechecks = f.get("rechecks")
+    if not isinstance(rechecks, list) or not rechecks:
+        return False
+    for rc in reversed(rechecks):
+        if isinstance(rc, dict):
+            return bool(rc.get("passed"))
+    return False
 
 
 def canonical_finding(f):
@@ -297,24 +408,25 @@ def canonical_finding(f):
         "disposition": disp,
         "dispositionNote": str(f.get("dispositionNote") or "")[:1000],
         "dispositionAt": _as_int(f.get("dispositionAt")),
-        "recheckPassed": bool(f.get("recheckPassed")),
+        # 服务端权威：是否复查通过只看真实复查记录，忽略客户端布尔位
+        "recheckPassed": bool(clean_rechecks) and clean_rechecks[-1]["passed"],
         "rechecks": clean_rechecks,
         "createdAt": _as_int(f.get("createdAt")) or 0,
     }
 
 
 def validate_inspection(payload, require_frozen=False):
-    """结构校验。frozen 只在新建时接受，更新时以已存快照为准。"""
+    """结构校验。
+
+    PUT：校验提交的逐卷状态/问题，frozen 一律以已存快照为准。
+    POST：只取单据头（名称、验片员、备注）；冻结快照由服务端按关联方案生成，
+    逐卷从 pending、空问题开始，客户端提交的 frozen / reels 仅用于核对卷序。
+    """
     if not isinstance(payload, dict):
         return None, "请求体不是 JSON 对象"
     plan_id = str(payload.get("planId") or "").strip()
     if not plan_id:
         return None, "缺少 planId"
-    frozen = payload.get("frozen") if isinstance(payload.get("frozen"), dict) else {}
-    freels = frozen.get("reels") if isinstance(frozen.get("reels"), list) else None
-    if require_frozen:
-        if not freels:
-            return None, "缺少冻结快照 frozen.reels"
     reels_in = payload.get("reels") if isinstance(payload.get("reels"), list) else []
     reels = []
     for r in reels_in:
@@ -335,7 +447,7 @@ def validate_inspection(payload, require_frozen=False):
         "name": str(payload.get("name") or "验片单")[:120],
         "inspector": str(payload.get("inspector") or "")[:80],
         "note": str(payload.get("note") or "")[:2000],
-        "frozen": frozen if require_frozen else {},
+        "frozen": {},
         "reels": reels,
     }
     return data, None
@@ -659,7 +771,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(row_to_rehearsal(row), 201)
             return
         if path == "/api/inspections":
-            clean, err = validate_inspection(payload, require_frozen=True)
+            clean, err = validate_inspection(payload)
             if err:
                 self.send_error_json(400, err)
                 return
@@ -675,12 +787,32 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute("SELECT 1 FROM inspections WHERE id = ?", (iid,)).fetchone():
                     self.send_error_json(409, "验片单 ID 已存在")
                     return
-                # 冻结快照的方案指纹与时间戳以已落盘方案为准（服务端权威）
-                clean["frozen"]["planHash"] = plan_content_hash(plan_row)
-                clean["frozen"]["planUpdatedAt"] = plan_row["updated_at"]
-                # 新建时逐卷状态一律从 pending 起，冻结快照以本次提交为准
-                for r in clean["reels"]:
-                    r["status"] = "pending"
+                # 冻结快照一律由服务端按「已保存」关联方案生成，拒绝客户端伪造卷数据
+                plan_obj = row_to_plan(plan_row)
+                frozen = freeze_plan(plan_obj)
+                canonical_ids = [fr["id"] for fr in frozen["reels"]]
+                submitted = [(r.get("reelId"), r.get("status"), len(r.get("findings") or []))
+                             for r in (clean.get("reels") or [])]
+                if submitted:
+                    # 严格核对：客户端若提交卷列表，其 ID 与卷序必须与方案一致，
+                    # 且新单不得夹带任何检查结果。
+                    if [s[0] for s in submitted] != canonical_ids:
+                        self.send_error_json(409, "冻结卷数据与关联方案不一致（快照由方案生成）")
+                        return
+                    if any(s[1] != "pending" or s[2] for s in submitted):
+                        self.send_error_json(409, "新验片单的卷必须为待检查且无检查结果")
+                        return
+                frozen["planId"] = clean["planId"]
+                frozen["planName"] = plan_obj["name"]
+                frozen["planHash"] = plan_content_hash(plan_row)
+                frozen["planUpdatedAt"] = plan_row["updated_at"]
+                frozen["frozenAt"] = now
+                clean["frozen"] = frozen
+                # 逐卷一律从 pending、空问题开始
+                clean["reels"] = [
+                    {"reelId": rid, "status": "pending", "findings": []}
+                    for rid in canonical_ids
+                ]
                 db.execute(
                     "INSERT INTO inspections (id, plan_id, name, data, created_at, updated_at)"
                     " VALUES (?,?,?,?,?,?)",

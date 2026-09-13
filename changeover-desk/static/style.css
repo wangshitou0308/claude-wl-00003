@@ -673,6 +673,7 @@ input:disabled { opacity: .5; }
 }
 .iv-loc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 4px; }
 .iv-loc label { font-size: 10px; color: var(--text-faint); display: block; margin-bottom: 2px; }
+.iv-loc input.iv-input-err { border-color: var(--red); color: var(--red); }
 .iv-form-btns { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
 .iv-rechecks { margin-top: 7px; font-size: 10.5px; }
 .iv-rechecks .ok { color: var(--teal); }
