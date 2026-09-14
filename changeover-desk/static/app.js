@@ -460,6 +460,17 @@
     var s = state.plan.settings || (state.plan.settings = {});
     var devs = s.devices || (s.devices = {});
     if (!devs[which]) devs[which] = E.defaultDevice(which);
+    // 兼容对象形式 {min,max}：就地展开为扁平 k / kMax 双字段，
+    // 保证只编辑一端时另一端的已存值仍在
+    E.DEVICE_FIELD_KEYS.forEach(function (fk) {
+      var v = devs[which][fk];
+      if (v && typeof v === "object") {
+        var hasMin = isFinite(parseFloat(v.min));
+        var hasMax = isFinite(parseFloat(v.max));
+        devs[which][fk] = hasMin ? parseFloat(v.min) : (hasMax ? parseFloat(v.max) : null);
+        devs[which][fk + "Max"] = hasMax ? parseFloat(v.max) : null;
+      }
+    });
     return devs[which];
   }
 
@@ -732,6 +743,13 @@
     a.computed.forEach(function (c) {
       var sx1 = xOf(c.pictureStart);
       var sx2 = xOf(c.picEnd);
+      // 起转实测范围造成的本卷画面到达窗口（除首卷：首卷手动启动，不影响衔接）
+      if (c.idx > 0 && c.picStartHi - c.picStartLo > 0.05) {
+        var j1 = xOf(c.picStartLo), j2 = xOf(c.picStartHi);
+        html.push(rect(j1, GEO.screenY - 3, Math.max(2, j2 - j1), GEO.screenH + 6, {
+          fill: "rgba(106,166,224,.22)", stroke: "#6aa6e0", "stroke-width": 0.6, rx: 1,
+        }));
+      }
       html.push(rect(sx1, GEO.screenY, Math.max(1, sx2 - sx1), GEO.screenH, {
         fill: "rgba(79,195,176,.22)", stroke: "#2e6b60", "stroke-width": 0.8,
       }));
@@ -741,10 +759,11 @@
       var nx = a.computed[idx + 1];
       if (!nx) return;
       var g = nx.pictureStart - c.changeCueT; // 正=空档，负=重叠
-      var gLo = nx.cueLeadMin - c.cueLeadMax;
-      var gHi = nx.cueLeadMax - c.cueLeadMin;
+      var gLo = nx.picStartLo - c.changeCueMax;
+      var gHi = nx.picStartHi - c.changeCueMin;
       var tol = s.gapToleranceSec;
-      // 存疑衔接风险包络
+      // 不确定衔接风险包络（提示存疑 ∪ 起转实测范围）：以切换刻点为基
+      // 向两侧展开 gap 极值，覆盖可能的空档与重叠
       if (gHi > tol || gLo < -tol) {
         var xa = xOf(c.changeCueT + Math.min(0, gLo));
         var xb = xOf(c.changeCueT + Math.max(0, gHi));
@@ -1577,16 +1596,16 @@
       var gapTxt = "—";
       if (nx) {
         var g = nx.pictureStart - c.changeCueT;
-        var gLo = nx.cueLeadMin - c.cueLeadMax;
-        var gHi = nx.cueLeadMax - c.cueLeadMin;
+        var gLo = nx.picStartLo - c.changeCueMax;
+        var gHi = nx.picStartHi - c.changeCueMin;
         var parts = [];
         if (g > s.gapToleranceSec) parts.push("空档 " + E.fmtSigned(g, 1) + " s");
         else if (g < -s.gapToleranceSec) parts.push("重叠 " + E.fmtSigned(-g, 1) + " s");
         else parts.push("标准衔接");
         if (gHi > s.gapToleranceSec && gHi > g)
-          parts.push("存疑空档≤" + E.fmtSigned(gHi, 1) + " s");
+          parts.push("不确定空档≤" + E.fmtSigned(gHi, 1) + " s");
         if (gLo < -s.gapToleranceSec && gLo < g)
-          parts.push("存疑重叠≤" + E.fmtSigned(-gLo, 1) + " s");
+          parts.push("不确定重叠≤" + E.fmtSigned(-gLo, 1) + " s");
         if (c.turnaround) {
           var t = c.turnaround;
           parts.push("周转 " + E.fmtSigned(t.slackWorst, 0) + "/" +

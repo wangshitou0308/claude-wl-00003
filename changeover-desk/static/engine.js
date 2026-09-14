@@ -79,19 +79,27 @@
 
   // 读取一个可能是单值 / {min,max} 的设备参数 -> {min,max,mid,hasRange,set}
   function deviceParam(raw, fallbackKey, settings) {
-    var lo = num(raw, NaN), hi;
+    var lo, hi;
     if (raw && typeof raw === "object") {
       lo = parseFloat(raw.min);
       hi = parseFloat(raw.max);
+    } else {
+      lo = parseFloat(raw);
+      hi = NaN;
     }
-    var set = isFinite(lo);
-    if (!isFinite(lo)) lo = parseFloat(settings[fallbackKey]);
+    var set = isFinite(lo) || isFinite(hi);   // 任一端填了实测值即视为已测
+    if (!isFinite(lo)) {
+      if (isFinite(hi)) lo = hi;              // 只填了上限：按单值处理
+      else lo = parseFloat(settings[fallbackKey]);
+    }
     if (!isFinite(hi)) hi = lo;
     if (lo > hi) { var t = lo; lo = hi; hi = t; }
     return { min: lo, max: hi, mid: (lo + hi) / 2, hasRange: hi > lo + 1e-9, set: set };
   }
 
-  // 归一化存档中的设备配置（保留原始单值/范围写法，缺省补 null）
+  // 归一化存档中的设备配置（保留原始单值/范围写法，缺省补 null）。
+  // 兼容旧的对象写法 {min,max}：展开为扁平的 k / kMax 双字段，
+  // 这样编辑器只编辑一端时不会覆盖另一端的已存值。
   function normalizeDevice(which, input) {
     var base = defaultDevice(which);
     if (input && typeof input === "object") {
@@ -99,6 +107,14 @@
         if (k in input && input[k] !== undefined) base[k] = input[k];
       }
     }
+    DEVICE_FIELD_KEYS.forEach(function (fk) {
+      var v = base[fk];
+      if (v && typeof v === "object") {
+        base[fk] = isFinite(parseFloat(v.min)) ? parseFloat(v.min)
+          : (isFinite(parseFloat(v.max)) ? parseFloat(v.max) : null);
+        base[fk + "Max"] = isFinite(parseFloat(v.max)) ? parseFloat(v.max) : null;
+      }
+    });
     base.name = String(base.name || (which === "B" ? "乙机" : "甲机"));
     return base;
   }
@@ -491,11 +507,16 @@
       c.threadedHi = c.rewindEndHi + d.rethreadSec.max;
       c.threadedFor = c.rewindEnd + d.rethreadSec.mid;
 
-      // 下一卷动作片头（挂片约定）：上一卷马达提示 + 下一卷自身提示间隔
+      // 下一卷动作片头（挂片约定）：上一卷马达提示 + 下一卷自身提示间隔。
+      // 挂片提前量 = 提示间隔 + 起转稳定时间，名义上起转时间在
+      // 「提前启动」与「护片走片」中抵消；但起转实测范围使实际片头
+      // 到达时刻相对中点前后抖动 ±(accelMax-accelMin)，必须计入包络。
       if (idx < computed.length - 1) {
         var nc2 = computed[idx + 1];
-        psLo = c.motorCueMin + (nc2.cOff.min - nc2.mOff.max) / nc2.fps;
-        psHi = c.motorCueMax + (nc2.cOff.max - nc2.mOff.min) / nc2.fps;
+        var nd = dev[nc2.reel.projector];
+        var accelJitter = nd.accelSec.hasRange ? (nd.accelSec.max - nd.accelSec.min) : 0;
+        psLo = c.motorCueMin + (nc2.cOff.min - nc2.mOff.max) / nc2.fps - accelJitter;
+        psHi = c.motorCueMax + (nc2.cOff.max - nc2.mOff.min) / nc2.fps + accelJitter;
         psMid = c.motorCueT + (nc2.cOff.mid - nc2.mOff.mid) / nc2.fps;
       }
     });
@@ -558,16 +579,19 @@
       // （= 本卷 motorCueT + 下一卷自身提示间隔）。
       //   gap>0 切换时下一卷画面未到（黑场）
       //   gap<0 切换时两卷画面同时在银幕（重叠）
-      // 用两边提示范围给出实际包络 [gapLo, gapHi]：
+      // 包络直接取绝对时刻的最不利组合（自动含提示范围与下一卷
+      // 起转稳定时间范围造成的片头到达抖动）：
       //   gapLo>tol            确定性空档
       //   gapHi<-tol           确定性重叠
       //   区间跨 tol / -tol    存疑潜在空档/重叠（可能同时存在两侧风险）
       var gapMid = next.pictureStart - c.changeCueT;
-      var gapLo = next.cueLeadMin - c.cueLeadMax;
-      var gapHi = next.cueLeadMax - c.cueLeadMin;
+      var gapLo = next.picStartLo - c.changeCueMax;
+      var gapHi = next.picStartHi - c.changeCueMin;
       var tol = settings.gapToleranceSec;
+      var deviceGapUncertain = next.dev.accelSec.hasRange;
       var doubtfulGap = c.change.uncertain || next.change.uncertain ||
-                        c.motor.uncertain || next.motor.uncertain;
+                        c.motor.uncertain || next.motor.uncertain ||
+                        deviceGapUncertain;
 
       function gapIssue(kind, msg, amount, doubt) {
         issues.push(makeIssue({
@@ -587,30 +611,35 @@
           "》画面在银幕重叠约 " + fmtSigned(-gapMid, 1) + " 秒，超过接片容差。",
           -gapMid - tol, false);
       } else {
-        // 包络未整体越界：检查存疑范围是否触及任一侧（越过容差才算风险）
+        // 包络未整体越界：检查不确定范围是否触及任一侧（越过容差才算风险）
+        var srcTxt = deviceGapUncertain && !(c.change.uncertain || next.change.uncertain ||
+                        c.motor.uncertain || next.motor.uncertain)
+          ? next.dev.name + "起转稳定时间存在范围（" +
+            next.dev.accelSec.min.toFixed(1) + "～" + next.dev.accelSec.max.toFixed(1) + " 秒），"
+          : "提示存疑时，";
         var gapPossible = gapHi > tol;
         var overlapPossible = gapLo < -tol;
         if (gapPossible && overlapPossible) {
-          // 两卷存疑范围交叉：同一衔接的包络同时覆盖空档与重叠
+          // 两卷范围交叉：同一衔接的包络同时覆盖空档与重叠
           gapIssue("gap",
             "《" + reel.title + "》→《" + next.reel.title +
-            "》存疑提示范围交叉：衔接包络 " + fmtSigned(gapLo, 1) + "～" +
+            "》不确定范围交叉：衔接包络 " + fmtSigned(gapLo, 1) + "～" +
             fmtSigned(gapHi, 1) + " 秒，可能出现最长 " + fmtSigned(gapHi, 1) +
             " 秒空档。",
             gapHi - tol, true);
           gapIssue("overlap",
             "《" + reel.title + "》→《" + next.reel.title +
-            "》存疑提示范围交叉：同一衔接可能出现最长 " +
-            fmtSigned(-gapLo, 1) + " 秒画面重叠，请现场核对两卷提示帧。",
+            "》不确定范围交叉：同一衔接可能出现最长 " +
+            fmtSigned(-gapLo, 1) + " 秒画面重叠，请现场核对提示帧与起转表现。",
             -gapLo - tol, true);
         } else if (gapPossible) {
           gapIssue("gap",
-            "提示存疑时，《" + reel.title + "》→《" + next.reel.title +
+            srcTxt + "《" + reel.title + "》→《" + next.reel.title +
             "》衔接可能出现最长 " + fmtSigned(gapHi, 1) + " 秒银幕空档。",
             gapHi - tol, true);
         } else if (overlapPossible) {
           gapIssue("overlap",
-            "提示存疑时，《" + reel.title + "》与《" + next.reel.title +
+            srcTxt + "《" + reel.title + "》与《" + next.reel.title +
             "》画面可能最长重叠 " + fmtSigned(-gapLo, 1) + " 秒。",
             -gapLo - tol, true);
         }
@@ -796,8 +825,8 @@
       if (!next) return;
       var tol = settings.gapToleranceSec;
       var gMid = next.pictureStart - c.changeCueT;
-      var gLo = next.cueLeadMin - c.cueLeadMax;
-      var gHi = next.cueLeadMax - c.cueLeadMin;
+      var gLo = next.picStartLo - c.changeCueMax;
+      var gHi = next.picStartHi - c.changeCueMin;
       if (gMid > tol) gap += gMid - tol;
       if (gMid < -tol) overlap += -gMid - tol;
       // 存疑包络中的潜在量（超出中点确定性部分、越过容差的量）
